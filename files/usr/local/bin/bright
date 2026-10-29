@@ -1,0 +1,29 @@
+#!/bin/bash
+# 亮度控制脚本
+D=/sys/class/backlight/ae94000.dsi.0
+MAX=$(cat $D/max_brightness)
+STEP=${2:-128}
+
+cur() { cat $D/brightness; }
+
+case "$1" in
+  up)
+    n=$(( $(cur) + STEP )); [ $n -gt $MAX ] && n=$MAX
+    echo $n > $D/brightness; echo "亮度: $n/$MAX"
+    ;;
+  down)
+    n=$(( $(cur) - STEP )); [ $n -lt 1 ] && n=1
+    echo $n > $D/brightness; echo "亮度: $n/$MAX"
+    ;;
+  set)
+    n=$2; [ $n -gt $MAX ] && n=$MAX; [ $n -lt 1 ] && n=1
+    echo $n > $D/brightness; echo "亮度: $n/$MAX"
+    ;;
+  get)
+    echo "亮度: $(cur)/$MAX ($(( $(cur) * 100 / $MAX ))%)"
+    ;;
+  *)
+    echo "用法: $0 {up|down|set <数值>|get}"
+    echo "范围: 1-$MAX"
+    ;;
+esac

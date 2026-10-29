@@ -1,0 +1,65 @@
+#!/bin/bash
+# 应用 q706f 扬声器安全配置
+# 用法: q706f-audio-setup [analog] [digital]
+set +e
+
+CONF=/etc/q706f-audio/speakers.conf
+ANALOG=${1:-}
+DIGITAL=${2:-}
+if [ -z "$ANALOG" ] || [ -z "$DIGITAL" ]; then
+    [ -f "$CONF" ] && . "$CONF"
+fi
+ANALOG=${ANALOG:-1}
+DIGITAL=${DIGITAL:-300}
+
+CARD=0
+[ -f /proc/asound/card0/id ] || { echo "q706f-audio: 声卡 0 不存在" >&2; exit 1; }
+
+# 等卡就绪（最多 10 秒）
+for i in $(seq 1 20); do
+    amixer -c $CARD sget 'SPK1 Amplifier Mode' >/dev/null 2>&1 && break
+    sleep 0.5
+done
+amixer -c $CARD sget 'SPK1 Amplifier Mode' >/dev/null 2>&1 || {
+    echo "q706f-audio: 找不到 SPK 控件（声卡未就绪）" >&2; exit 1; }
+
+for i in 1 2 3 4; do
+    ss() { amixer -c $CARD sset "$1" "$2" >/dev/null 2>&1; }
+    ss "SPK$i DSP1 Firmware"    Protection
+    ss "SPK$i DSP1 Preload"     on
+    ss "SPK$i Amplifier Mode"   SPK
+    ss "SPK$i DSP_RX1 Source"   ASP_RX1
+    ss "SPK$i DSP_RX2 Source"   ASP_RX2
+    ss "SPK$i ASP_TX1 Source"   Zero
+    ss "SPK$i ASP_TX2 Source"   Zero
+    ss "SPK$i ASP_TX3 Source"   Zero
+    ss "SPK$i ASP_TX4 Source"   Zero
+    ss "SPK$i DSP_RX5 Source"   VDD_BATTMON
+    ss "SPK$i DSP_RX6 Source"   VDD_BSTMON
+    ss "SPK$i DSP_RX7 Source"   CLASSH_TGT
+    ss "SPK$i Analog PCM"       "$ANALOG"
+    ss "SPK$i Digital PCM"      "$DIGITAL"
+    ss "SPK$i AMP Enable"       off
+done
+
+# ASP 通道 / 槽位
+amixer -c $CARD sset 'SPK1 ASPRX1 Slot Position' 0 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK1 ASPRX2 Slot Position' 1 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK2 ASPRX1 Slot Position' 0 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK2 ASPRX2 Slot Position' 1 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK3 ASPRX1 Slot Position' 0 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK3 ASPRX2 Slot Position' 2 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK4 ASPRX1 Slot Position' 0 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK4 ASPRX2 Slot Position' 2 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK1 DACPCM Source' ASP_RX1 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK2 DACPCM Source' ASP_RX1 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK3 DACPCM Source' ASP_RX2 >/dev/null 2>&1
+amixer -c $CARD sset 'SPK4 DACPCM Source' ASP_RX2 >/dev/null 2>&1
+
+# 前端路由
+for n in 1 2 3 4 5 6 7 8; do
+    amixer -c $CARD sset "PRIMARY_TDM_RX_0 Audio Mixer MultiMedia$n" on >/dev/null 2>&1
+done
+
+echo "q706f-audio: Analog=$ANALOG Digital=$DIGITAL 已应用"
+exit 0

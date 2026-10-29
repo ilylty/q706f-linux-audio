@@ -1,0 +1,10 @@
+[Unit]
+Description=Restore backlight brightness to 100
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 100 > /sys/class/backlight/ae94000.dsi.0/brightness'
+
+[Install]
+WantedBy=multi-user.target

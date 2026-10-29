@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=QSidebar Actions Center
+Comment=Android-style control center for the right edge
+Exec=env HOME=/root /usr/local/bin/qsidebar
+Icon=preferences-desktop
+Terminal=false
+StartupNotify=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true

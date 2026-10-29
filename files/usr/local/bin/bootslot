@@ -1,0 +1,107 @@
+#!/bin/bash
+# bootslot —— A/B 槽位切换（Linux ↔ Android）
+#
+# 用法:
+#   bootslot a              切到 A 槽（Linux）并重启
+#   bootslot b              切到 B 槽（Android）并重启
+#   bootslot a --no-reboot  只切不重启
+#   bootslot show           查看当前状态
+#   bootslot fix            修复两个槽的 successful 标记
+#
+# 说明:
+#   qbootctl 的槽名不带下划线: 用 "a" / "b"，不是 "_a" / "_b"
+
+MISC=/dev/disk/by-partlabel/misc
+BACKUP_DIR=/var/backups/bootslot
+
+show() {
+  echo "=== 槽位状态 ==="
+  qbootctl 2>&1
+  echo
+  echo "=== 本次启动的槽 (cmdline) ==="
+  tr ' ' '\n' < /proc/cmdline | grep slot_suffix || echo "(无 slot_suffix)"
+}
+
+case "$1" in
+  show|"")
+    show
+    exit 0
+    ;;
+  fix)
+    echo "=== 修复前 ==="
+    qbootctl 2>&1
+    qbootctl -m a 2>&1
+    qbootctl -m b 2>&1
+    sync
+    echo
+    echo "=== 修复后 ==="
+    qbootctl 2>&1
+    exit 0
+    ;;
+  a|A)
+    SLOT=a
+    LABEL="Linux (Arch ARM)"
+    ;;
+  b|B)
+    SLOT=b
+    LABEL="Android"
+    ;;
+  *)
+    echo "用法: $0 {a|b|show|fix} [--no-reboot]"
+    echo "  a    = 切到 Linux (Arch ARM) 并重启"
+    echo "  b    = 切到 Android 并重启"
+    echo "  show = 只看状态"
+    echo "  fix  = 修复两个槽的 successful 标记"
+    exit 1
+    ;;
+esac
+
+NO_REBOOT=0
+[ "$2" = "--no-reboot" ] && NO_REBOOT=1
+
+echo "=== 切换前 ==="
+qbootctl 2>&1
+
+# 备份 misc（保留最近 5 份）
+mkdir -p "$BACKUP_DIR"
+STAMP=$(date +%Y%m%d-%H%M%S)
+dd if="$MISC" of="$BACKUP_DIR/misc-${STAMP}.bin" bs=4096 2>/dev/null
+ls -t "$BACKUP_DIR"/misc-*.bin 2>/dev/null | tail -n +6 | xargs -r rm -f
+echo
+echo "已备份 misc -> misc-${STAMP}.bin"
+
+# 切槽
+echo
+echo "=== 切换到 $SLOT 槽 ($LABEL) ==="
+qbootctl -s "$SLOT" 2>&1
+echo "--- 切换后 ---"
+qbootctl 2>&1
+
+# 标记成功，防止重试计数归零触发回滚
+echo
+echo "=== 标记 $SLOT 可启动 ==="
+qbootctl -m "$SLOT" 2>&1 || true
+
+sync
+echo
+echo "=== 最终状态 ==="
+qbootctl 2>&1
+
+if [ $NO_REBOOT -eq 1 ]; then
+  echo
+  echo "*** 已切换，未重启。执行 reboot 后生效 ***"
+  exit 0
+fi
+
+echo
+if [ "$SLOT" = "b" ]; then
+  echo "*** 3 秒后重启进入 Android ***"
+  echo "*** 回 Linux 的方法 (二选一): ***"
+  echo "***   1) Android 里: adb reboot bootloader && fastboot --set-active=a && fastboot reboot ***"
+  echo "***   2) 平板上跑: 看下面这条命令 ***"
+  echo "***      su -c '/data/local/tmp/bootslot a'  (需先推送) ***"
+else
+  echo "*** 3 秒后重启进入 Linux ***"
+fi
+sleep 3
+reboot

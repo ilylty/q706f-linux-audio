@@ -1,0 +1,18 @@
+[Unit]
+Description=Touch screen gesture daemon (Goodix -> XTEST)
+After=graphical.target lightdm.service
+Wants=lightdm.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/var/run/lightdm/root/:0
+ExecStartPre=/bin/sh -c 'until [ -e /tmp/.X11-unix/X0 ]; do sleep 0.5; done; sleep 3'
+ExecStart=/usr/bin/python3 /usr/local/bin/touchd.py -v
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/touchd.log
+StandardError=append:/var/log/touchd.log
+
+[Install]
+WantedBy=graphical.target

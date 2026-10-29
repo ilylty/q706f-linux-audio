@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Onboard
+GenericName=Onboard onscreen keyboard
+GenericName[zh_CN]=Onboard 屏幕键盘
+Comment=Flexible onscreen keyboard
+Comment[zh_CN]=灵活的屏幕键盘
+Exec=env HOME=/root onboard --not-show-in=GNOME,GNOME-Classic:GNOME
+Icon=onboard
+Type=Application
+NoDisplay=true
+X-Ubuntu-Gettext-Domain=onboard
+X-GNOME-AutoRestart=true

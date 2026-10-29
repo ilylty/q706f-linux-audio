@@ -1,0 +1,13 @@
+[Unit]
+Description=q706f speakers safe volume setup
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/q706f-audio-setup
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

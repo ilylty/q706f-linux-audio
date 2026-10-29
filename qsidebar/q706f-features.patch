@@ -1,0 +1,236 @@
+--- qsidebar.c.orig	2026-10-29 16:22:10.643067030 +0000
++++ qsidebar.c	2026-10-29 16:21:26.000000000 +0000
+@@ -242,6 +242,13 @@
+ 
+ static BacklightInfo backlight_info = {NULL, 0, 0};
+ static GtkWidget *backlight_slider = NULL;
++static GtkWidget *volume_slider = NULL;
++
++/* 音量上限：sink 音量最高 70%（配合 SPK Analog=1 / Digital=300 硬件层，
++   总输出仍远低于原厂满增益，避免四功放拉垮电池） */
++#define MAX_VOLUME_PCT 70.0
++#define VOLUME_ICON_PATH "/usr/share/qsidebar/icons/volume.png"
++
+ static gboolean initialize_backlight(void);
+ static guint regenerate_timeout_id = 0;
+ static uint8_t current_popup_urgency = 255;
+@@ -446,6 +453,10 @@
+     char icon_path[MAX_LINE_LENGTH];
+     char cmd[MAX_LINE_LENGTH];
+     char initstate_cmd[MAX_LINE_LENGTH];
++    char label_cmd[MAX_LINE_LENGTH];
++    GtkWidget *label_widget;
++    guint label_timer;
++    int label_interval;
+     char confirm_text[MAX_LINE_LENGTH];
+     GtkWidget *button;                // 8 octets
+     unsigned int confirm_cmd      : 1;
+@@ -1642,6 +1653,10 @@
+         button_configs[i].icon_path[0] = '\0';
+         button_configs[i].cmd[0] = '\0';
+         button_configs[i].initstate_cmd[0] = '\0';
++        button_configs[i].label_cmd[0] = '\0';
++        button_configs[i].label_widget = NULL;
++        button_configs[i].label_timer = 0;
++        button_configs[i].label_interval = 5;
+         button_configs[i].confirm_cmd = FALSE;
+         button_configs[i].confirm_text[0] = '\0';
+         button_configs[i].button = NULL;
+@@ -2181,6 +2196,14 @@
+         }
+     } else if (strcmp(property, "cmd") == 0) {
+         strncpy(button_configs[button_idx].cmd, value, MAX_LINE_LENGTH - 1);
++    } else if (strcmp(property, "label_cmd") == 0) {
++        strncpy(button_configs[button_idx].label_cmd, value, MAX_LINE_LENGTH - 1);
++        button_configs[button_idx].label_cmd[MAX_LINE_LENGTH - 1] = '\0';
++    } else if (strcmp(property, "label_interval") == 0) {
++        int v = atoi(value);
++        if (v < 1) v = 1;
++        if (v > 3600) v = 3600;
++        button_configs[button_idx].label_interval = v;
+     } else if (strcmp(property, "initstate_cmd") == 0) {
+         strncpy(button_configs[button_idx].initstate_cmd, value, MAX_LINE_LENGTH - 1);
+     } else if (strcmp(property, "confirm_cmd") == 0) {
+@@ -2874,7 +2897,13 @@
+                         gtk_widget_override_font(second_label, quickbuttons_font_desc);
+                         #pragma GCC diagnostic pop
+                         gtk_widget_set_halign(second_label, GTK_ALIGN_START);
++                        gtk_label_set_line_wrap(GTK_LABEL(second_label), TRUE);
++                        gtk_label_set_lines(GTK_LABEL(second_label), 2);
++                        gtk_label_set_ellipsize(GTK_LABEL(second_label), PANGO_ELLIPSIZE_END);
++                        gtk_label_set_max_width_chars(GTK_LABEL(second_label), 11);
++                        gtk_label_set_line_wrap_mode(GTK_LABEL(second_label), PANGO_WRAP_WORD_CHAR);
+                         gtk_box_pack_start(GTK_BOX(label_box), second_label, FALSE, FALSE, 0);
++                        config->label_widget = second_label;
+                     } else {
+                         GtkWidget *label = gtk_label_new(config->name);
+                         #pragma GCC diagnostic push
+@@ -2882,7 +2911,13 @@
+                         gtk_widget_override_font(label, quickbuttons_font_desc);
+                         #pragma GCC diagnostic pop
+                         gtk_widget_set_halign(label, GTK_ALIGN_START);
++                        gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
++                        gtk_label_set_lines(GTK_LABEL(label), 2);
++                        gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
++                        gtk_label_set_max_width_chars(GTK_LABEL(label), 11);
++                        gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
+                         gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
++                        config->label_widget = label;
+                     }
+                 }
+                 if (scaled_pixbuf)
+@@ -2898,6 +2933,10 @@
+         gtk_style_context_add_class(gtk_widget_get_style_context(button), "original-button");
+     }
+     gtk_widget_set_size_request(button, button_width, button_height);
++    gtk_widget_set_hexpand(button, TRUE);
++    gtk_widget_set_vexpand(button, FALSE);
++    if (config->label_cmd[0] != '\0' && config->label_widget != NULL)
++        start_label_timer(config);
+     return button;
+ }
+ 
+@@ -3303,7 +3342,7 @@
+     GtkWidget *quick_settings = gtk_box_new(GTK_ORIENTATION_VERTICAL, QUICKSETTINGS_BUTTON_MARGIN);
+     int usable_width = width - 2 * QUICKSETTINGS_MARGIN;
+     int button_width = (usable_width - 3 * QUICKSETTINGS_BUTTON_MARGIN) / QUICKSETTINGS_BUTTONS_PER_ROW;
+-    int button_height = button_width * 5 / 6;
++    int button_height = button_width * 4 / 5;   /* 4/5 给两行文字留高度 */
+     int num_rows = (num_buttons + QUICKSETTINGS_BUTTONS_PER_ROW - 1) / QUICKSETTINGS_BUTTONS_PER_ROW;
+     delete_notifications_button = gtk_button_new_with_label("Delete notifications");
+     GtkStyleContext *ctx = gtk_widget_get_style_context(delete_notifications_button);
+@@ -3346,13 +3385,13 @@
+                     }
+                 }
+                 g_signal_connect(button, "clicked", G_CALLBACK(on_button_clicked), config);
+-                gtk_box_pack_start(GTK_BOX(button_row), button, FALSE, FALSE, 0);
++                gtk_box_pack_start(GTK_BOX(button_row), button, TRUE, TRUE, 0);
+             }
+         }
+         for (int i = buttons_in_row; i < QUICKSETTINGS_BUTTONS_PER_ROW; i++) {
+             GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+             gtk_widget_set_size_request(spacer, button_width, button_height);
+-            gtk_box_pack_start(GTK_BOX(button_row), spacer, FALSE, FALSE, 0);
++            gtk_box_pack_start(GTK_BOX(button_row), spacer, TRUE, TRUE, 0);
+         }
+         gtk_box_pack_start(GTK_BOX(quick_settings), button_row, FALSE, FALSE, 0);
+     }
+@@ -3388,6 +3427,29 @@
+         gtk_widget_set_size_request(slider_container, total_slider_width, -1);
+         gtk_widget_set_halign(slider_container, GTK_ALIGN_CENTER);
+         gtk_box_pack_start(GTK_BOX(quick_settings), slider_container, FALSE, FALSE, 0);
++
++        /* ===== 音量滑动条（上限 MAX_VOLUME_PCT）===== */
++        GtkWidget *vol_container = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
++        gtk_widget_set_margin_start(vol_container, QUICKSETTINGS_MARGIN);
++        gtk_widget_set_margin_end(vol_container, QUICKSETTINGS_MARGIN);
++        gtk_widget_set_margin_top(vol_container, 6);
++        GdkPixbuf *vpix = gdk_pixbuf_new_from_file_at_size(VOLUME_ICON_PATH, icon_size, icon_size, NULL);
++        if (vpix) {
++            GtkWidget *vicon = gtk_image_new_from_pixbuf(vpix);
++            gtk_box_pack_start(GTK_BOX(vol_container), vicon, FALSE, FALSE, 0);
++            g_object_unref(vpix);
++        }
++        volume_slider = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, MAX_VOLUME_PCT, 1.0);
++        gtk_style_context_add_class(gtk_widget_get_style_context(volume_slider), "backlight-slider");
++        gtk_scale_set_draw_value(GTK_SCALE(volume_slider), FALSE);
++        gtk_widget_set_size_request(volume_slider, total_slider_width - icon_size - 5, 30);
++        gtk_range_set_value(GTK_RANGE(volume_slider), get_volume_percentage());
++        gtk_box_pack_start(GTK_BOX(vol_container), volume_slider, TRUE, TRUE, 0);
++        g_signal_connect(volume_slider, "value-changed", G_CALLBACK(volume_slider_changed), NULL);
++        gtk_widget_set_size_request(vol_container, total_slider_width, -1);
++        gtk_widget_set_halign(vol_container, GTK_ALIGN_CENTER);
++        gtk_box_pack_start(GTK_BOX(quick_settings), vol_container, FALSE, FALSE, 0);
++
+         GtkWidget *slider_spacer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+         gtk_widget_set_size_request(slider_spacer, -1, 20);
+         gtk_box_pack_start(GTK_BOX(quick_settings), slider_spacer, FALSE, FALSE, 0);
+@@ -4127,7 +4189,7 @@
+     int num_rows = (num_buttons + QUICKSETTINGS_BUTTONS_PER_ROW - 1) / QUICKSETTINGS_BUTTONS_PER_ROW;
+     int usable_width = width - 2 * QUICKSETTINGS_MARGIN;
+     int button_width = (usable_width - 3 * QUICKSETTINGS_BUTTON_MARGIN) / QUICKSETTINGS_BUTTONS_PER_ROW;
+-    int button_height = button_width * 5 / 6;
++    int button_height = button_width * 4 / 5;   /* 4/5 给两行文字留高度 */
+     int button_rows_height = num_rows * button_height + (num_rows > 1 ? (num_rows - 1) * QUICKSETTINGS_BUTTON_MARGIN : 0);
+     int main_box_spacing = 20;
+     int slider_bottom_margin = (sidebar_flags & FLAG_BACKLIGHT_CONTROL) ? 20 : 0;
+@@ -4711,12 +4773,79 @@
+ 
+ 
+ 
++/* 读当前 sink 音量百分比（经 pactl） */
++static int get_volume_percentage(void) {
++    FILE *fp = popen("pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | head -1", "r");
++    if (!fp) return 0;
++    char buf[512] = {0};
++    int pct = -1;
++    if (fgets(buf, sizeof(buf) - 1, fp)) {
++        char *q = strchr(buf, '%');
++        if (q) {                       /* 往回找数字 */
++            char *p = q;
++            while (p > buf && (*(p-1) >= '0' && *(p-1) <= '9')) p--;
++            if (p < q) pct = atoi(p);
++        }
++    }
++    pclose(fp);
++    return pct < 0 ? 0 : pct;
++}
++
++/* 设 sink 音量（强制不超过 MAX_VOLUME_PCT） */
++static void set_volume_percentage(double value) {
++    if (value > MAX_VOLUME_PCT) value = MAX_VOLUME_PCT;
++    if (value < 0.0) value = 0.0;
++    char cmd[256];
++    snprintf(cmd, sizeof(cmd),
++             "pactl set-sink-volume @DEFAULT_SINK@ %d%% 2>/dev/null", (int)(value + 0.5));
++    if (system(cmd) != 0) { /* 忽略 */ }
++}
++
++static void volume_slider_changed(GtkRange *range, gpointer user_data) {
++    (void)user_data;
++    double v = gtk_range_get_value(range);
++    if (v > MAX_VOLUME_PCT) {          /* 拖过头就弹回上限 */
++        gtk_range_set_value(range, MAX_VOLUME_PCT);
++        v = MAX_VOLUME_PCT;
++    }
++    set_volume_percentage(v);
++}
++
+ static void slider_changed(GtkRange *range, gpointer user_data) {
+     (void)user_data;
+     double value = gtk_range_get_value(range);
+     set_brightness_percentage(value);
+ }
+ 
++/* ===== 动态按钮文字：执行 label_cmd，把输出贴到按钮上 ===== */
++static gboolean update_button_label(gpointer data) {
++    ButtonConfig *cfg = (ButtonConfig *)data;
++    if (!cfg || !cfg->label_cmd[0] || !cfg->label_widget) return G_SOURCE_REMOVE;
++    char full_cmd[MAX_LINE_LENGTH * 2];
++    if (cfg->label_cmd[0] == '/')
++        snprintf(full_cmd, sizeof(full_cmd), "%s", cfg->label_cmd);
++    else
++        snprintf(full_cmd, sizeof(full_cmd), "%s%s", SCRIPT_PATH, cfg->label_cmd);
++    FILE *fp = popen(full_cmd, "r");
++    if (!fp) return G_SOURCE_CONTINUE;
++    char out[MAX_LINE_LENGTH] = {0};
++    if (fgets(out, sizeof(out) - 1, fp)) {
++        size_t L = strlen(out);
++        while (L && (out[L-1] == '\n' || out[L-1] == '\r' || out[L-1] == ' ')) out[--L] = '\0';
++        if (out[0]) gtk_label_set_text(GTK_LABEL(cfg->label_widget), out);
++    }
++    pclose(fp);
++    return G_SOURCE_CONTINUE;
++}
++
++static void start_label_timer(ButtonConfig *cfg) {
++    if (!cfg || !cfg->label_cmd[0] || !cfg->label_widget) return;
++    update_button_label(cfg);
++    if (cfg->label_timer) g_source_remove(cfg->label_timer);
++    cfg->label_timer = g_timeout_add_seconds(cfg->label_interval > 0 ? cfg->label_interval : 5,
++                                             update_button_label, cfg);
++}
++
+ 
+ 
+ 
