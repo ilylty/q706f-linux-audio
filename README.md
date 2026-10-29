@@ -262,7 +262,7 @@ ConditionUser=
 
 ## qsidebar 扩展补丁
 
-`qsidebar/q706f-features.patch` 给 [seb3773/qsidebar](https://github.com/seb3773/qsidebar) 加了 **17 处改动**：
+`qsidebar/q706f-features.patch` 给 [seb3773/qsidebar](https://github.com/seb3773/qsidebar) 加了 **32 处改动**：
 
 ### 动态按钮文字（8 处）
 
@@ -301,6 +301,51 @@ gtk_label_set_line_wrap_mode(label, PANGO_WRAP_WORD_CHAR);   // 中文按字断�
 
 `MAX_VOLUME_PCT = 70.0`，拖动超过自动弹回。放在背光条下面，走 `pactl set-sink-volume`。
 
+### 按钮数量不限（1 处）
+
+`#define MAX_BUTTONS 16` → `128`。
+
+### 控制中心滚动（3 处）
+
+- `quick_settings` 包进 `GtkScrolledWindow`（`kinetic_scrolling=TRUE`，滚轮步长 `qs_scroll_step=90`）
+- **滑动条拆到独立的 `qs_sliders_box`，`pack_end` 固定在底部，不随按钮滚动**
+
+> 踩过的坑：一开始把整个 `quick_settings`（含滑动条）塞进滚动区，结果两个滑动条被裁到可视区外面。滑动条必须留在滚动区外。
+
+### 独立通知中心（6 处）
+
+通知从控制中心剥离，做成**左侧独立面板**，与控制中心同时弹出/收起：
+
+| 组件 | 说明 |
+|---|---|
+| `create_notification_center()` | 独立 `GtkWindow`，`x = 0`，与控制中心对称 |
+| `find_widget_by_name()` | 递归查找 `notification-box`（通知中心是 `window→outer→sw→box` 嵌套结构） |
+| `animate_notif_center()` | **专用动画**：从左进、向左出 |
+| `toggle_notif_center(show)` | 驱动开关，由 `SIGUSR1`（控制中心）同步调用 |
+| `NOTIF_CENTER_MAX_SHOW = 256` | 通知中心有滚动条，不再截断成 `(+N more...)` |
+| `SIGUSR2` | 单独切换通知中心 |
+
+**为什么需要专用动画**：`animate_window_normal` 的 SLIDE 分支假定窗口从**右边**滑入（`start_x > target_x`），关闭条件是 `current_x < target_x - 5`。通知中心从**左边**滑入（`start_x = -width < target_x = 0`），这个条件永不成立，窗口会卡在屏幕上。
+
+### 点击外部收起（3 处）
+
+透明点击层只覆盖**两个中心之间的夹缝**：
+
+```c
+int click_window_width = screen_w - 2 * width;   // 2560 - 1420 = 1140
+int click_window_x     = workarea.x + width;     // 从 710 开始
+gtk_window_move(click_window, click_window_x, workarea.y);
+```
+
+**踩过的坑**：原先是 `workarea.width - width` 从 `x=0` 开始盖，通知中心正好落在点击层里，点通知中心等于点“外部”，控制中心被误关。
+
+`on_click_outside` 里额外调 `toggle_notif_center(0)`，点夹缝时两个中心一起收。
+
+### 控制中心去通知残留（2 处）
+
+- 不再创建「Delete notifications」按钮（通知中心自带「清空全部通知」）
+- `delete_button_height` 归零，高度让给按钮区
+
 ### 编译
 
 ```bash
@@ -323,6 +368,8 @@ sudo install -m755 qsidebar /usr/local/bin/
 | `option_dark_mode=1` | SIGSEGV（`gdk_pixbuf_get_width` 收 NULL，源头 `invert_pixbuf_colors` 对无 alpha 图标返回 NULL） | 别用，改 `option_tint` |
 | 配置路径写死 | 源码里是 `/home/%s/.qsidebar/`，`$HOME` 不生效 | `ln -sfn /root/.qsidebar /home/root/.qsidebar` |
 | 与 xfce4-notifyd 冲突 | `Not primary owner of org.freedesktop.Notifications` 直接退出 | `pkill xfce4-notifyd` + autostart 加 `Hidden=true` |
+| 触摸拖动无法滚动 | GTK3 `ScrolledWindow` 对触摸屏拖动支持不全，`kinetic_scrolling` 只管滚轮惯性 | 需要外部手势守护（touchd）把单指上下滑翻译成滚轮事件 |
+| 两个面板宽度相近（710 / 740） | touchd 的窗口探测 `500 <= W <= 1200` 会随机抓错 | 按精确宽度区分，或读窗口标题 |
 
 ---
 

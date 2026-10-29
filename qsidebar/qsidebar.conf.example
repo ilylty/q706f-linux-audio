@@ -1,0 +1,98 @@
+# qsidebar 配置片段 —— 联想小新 Pad Pro 12.6 (q706f) 推荐值
+#
+# 用法：把需要的段追加到 ~/.qsidebar/qsidebar.conf 末尾，然后
+#   kill -HUP $(pgrep -x qsidebar)
+#
+# 注意：源码里配置路径是写死的 /home/%s/.qsidebar/，$HOME 不生效
+#   若配置放在 /root/.qsidebar/，需软链：
+#   ln -sfn /root/.qsidebar /home/root/.qsidebar
+
+# ============================================================
+#  外观（浅色，别开 dark_mode，源码里 dark_mode=1 必段错误）
+# ============================================================
+option_tint=default
+option_dark_mode=0
+option_opacity=0.98
+option_panel_title=控制中心
+option_panel_anim_type=slide
+option_rounded_buttons=1
+
+# 透明点击层：点两个中心之间的夹缝收起面板
+option_use_transparent_click=1
+option_transparent_click_mode=ALL
+option_transparent_type=COMBO
+
+# 亮度 + 音量滑动条（固定在底部，不随按钮滚动）
+option_backlight_control=1
+
+# ============================================================
+#  动态文字按钮示例
+#
+#  label_cmd       脚本名（相对 /usr/share/qsidebar/scripts/，也可写绝对路径）
+#  label_interval  刷新间隔秒，1–3600
+#
+#  文字规则：能放一行就一行，放不下折两行，两行还放不下加省略号
+#  安全长度：中文 ≤ 6 字 / 英文数字 ≤ 10 字符（宽度上限 11 字符）
+# ============================================================
+
+# --- 槽位（A/B 双系统）---
+button_11_name=槽位
+button_11_type=oneshot
+button_11_icon=slot_now.png
+button_11_cmd=/usr/local/bin/qs-slot-toggle.sh
+button_11_label_cmd=slot_label.sh
+button_11_label_interval=10
+
+# --- 电量 ---
+button_12_name=电量
+button_12_type=oneshot
+button_12_icon=bat.png
+button_12_cmd=xfce4-power-manager-settings
+button_12_label_cmd=bat_label.sh
+button_12_label_interval=15
+
+# --- WiFi SSID ---
+button_13_name=WiFi
+button_13_type=oneshot
+button_13_icon=wifi.png
+button_13_cmd=nm-connection-editor
+button_13_label_cmd=wifi_label.sh
+button_13_label_interval=10
+
+# --- 切槽重启（带确认框）---
+button_14_name=重启到 A
+button_14_type=oneshot
+button_14_icon=slot_linux.png
+button_14_cmd=/usr/local/bin/qs-boot-a.sh
+button_14_confirm_cmd=1
+button_14_confirm_text=切换到 A 槽（Linux）并重启？
+
+button_15_name=重启到 B
+button_15_type=oneshot
+button_15_icon=slot_android.png
+button_15_cmd=/usr/local/bin/qs-boot-b.sh
+button_15_confirm_cmd=1
+button_15_confirm_text=切换到 B 槽（Android）并重启？
+
+button_16_name=重启
+button_16_type=oneshot
+button_16_icon=reboot.png
+button_16_cmd=systemctl reboot
+button_16_confirm_cmd=1
+button_16_confirm_text=确定要重启吗？
+
+# ============================================================
+#  加更多按钮（上限已从 16 提到 128）
+#
+#  自己写脚本 /usr/share/qsidebar/scripts/disk_label.sh:
+#    #!/bin/sh
+#    df -h / | tail -1 | awk '{printf "剩 %s", $4}'
+#
+#  然后：
+#    button_17_name=磁盘
+#    button_17_type=oneshot
+#    button_17_icon=drive-harddisk.png
+#    button_17_cmd=xfce4-settings-manager
+#    button_17_label_cmd=disk_label.sh
+#    button_17_label_interval=30
+# ============================================================

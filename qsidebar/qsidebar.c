@@ -43,7 +43,7 @@
 #define BT_DBUS_MANAGER_PATH "/org/bluez"
 #define BT_DBUS_ADAPTER_IFACE "org.bluez.Adapter1"
 #define BT_DBUS_PROPERTIES_IFACE "org.freedesktop.DBus.Properties"
-#define MAX_BUTTONS 16
+#define MAX_BUTTONS 128   /* 不再限制 16 个 */
 #define MAX_LINE_LENGTH 200
 #define MAX_ICON_LENGTH 8192 
 #define MAX_DBUS_NOTIFICATIONS 40
@@ -226,6 +226,8 @@ static GdkWindowTypeHint notif_type_hint = GDK_WINDOW_TYPE_HINT_DOCK;
 static GtkStatusIcon *status_icon = NULL;
 static guint timeout_id = 0;
 static int max_notification_buttons = 0;
+/* ★ 通知中心有滚动条，条数不设限 */
+#define NOTIF_CENTER_MAX_SHOW 256
 static const char *notification_sound = "/usr/share/qsidebar/sounds/notify_win10.wav";
 char panel_title[MAX_LINE_LENGTH];
 char panel_background[MAX_LINE_LENGTH];
@@ -427,7 +429,8 @@ typedef struct {
     unsigned int is_opening      : 1;
     unsigned int is_project_panel: 1;
     unsigned int update_pending  : 1;
-    unsigned int _unused         : 4;
+    unsigned int is_notif_center : 1;   /* ★ 这是通知中心面板 */
+    unsigned int _unused         : 3;
 } AnimationData;
 
 
@@ -490,6 +493,17 @@ NotifFilter notif_filters[MAX_FILTERS];
 
 
 AnimationData *anim_data = NULL;
+/* ★ 通知中心独立窗口 */
+static AnimationData *notif_center_data = NULL;
+/* ★ 两边的滚动容器（供触摸/滚动条使用） */
+static GtkWidget *qs_scrolled = NULL;          /* 控制中心滚动容器 */
+static GtkWidget *qs_sliders_box = NULL;       /* ★ 固定底部的滑动条盒子（不滚动） */
+static GtkWidget *nc_scrolled = NULL;          /* 通知中心滚动容器 */
+/* ★ 触摸优化参数（可从配置覆盖） */
+static int touch_inertia_boost = 1;            /* 触摸惯性增强 */
+static int qs_scroll_step = 90;                /* 每次滚轮滚动的像素 */
+static gboolean on_qs_scroll(GtkWidget *widget, GdkEventScroll *ev, gpointer user_data);
+static void toggle_notif_center(int show);
 
 
 
@@ -993,8 +1007,9 @@ static void update_window_sizes(AnimationData *anim_data) {
         : anim_data->height;
     gtk_window_resize(GTK_WINDOW(anim_data->window), anim_data->width, window_height);
     if (anim_data->click_window) {
-        int click_window_width = workarea.width - anim_data->width;
-        int click_window_x = workarea.x;
+        int click_window_width = workarea.width - 2 * anim_data->width;
+        if (click_window_width < 10) click_window_width = 10;
+        int click_window_x = workarea.x + anim_data->width;   /* ★ 避开左侧通知中心 */
         int click_window_y = workarea.y;
         gtk_window_resize(GTK_WINDOW(anim_data->click_window), click_window_width, window_height);
         gtk_window_move(GTK_WINDOW(anim_data->click_window), click_window_x, click_window_y);
@@ -2291,11 +2306,23 @@ gboolean recreate_original_buttons(gpointer user_data __attribute__((unused))) {
 #pragma GCC diagnostic pop
     gtk_style_context_add_class(gtk_widget_get_style_context(label), "actions-center-label");
     gtk_box_pack_start(GTK_BOX(header_box), label, FALSE, FALSE, 0);
-    add_notification_to_panel(box, anim_data->width, anim_data->height);
-    GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_box_pack_start(GTK_BOX(box), spacer, TRUE, TRUE, 0);
     GtkWidget *quick_settings = create_quick_settings_panel(anim_data->width, anim_data->height);
-    gtk_box_pack_end(GTK_BOX(box), quick_settings, FALSE, FALSE, bottom_margin);
+    if (qs_sliders_box) {
+        gtk_box_pack_end(GTK_BOX(box), qs_sliders_box, FALSE, FALSE, 0);
+    }
+    {
+        GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+                                       GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(sw), FALSE);
+        gtk_scrolled_window_set_kinetic_scrolling(GTK_SCROLLED_WINDOW(sw), TRUE);
+        gtk_widget_set_name(sw, "qs-scrolled");
+        gtk_container_add(GTK_CONTAINER(sw), quick_settings);
+        gtk_widget_set_size_request(sw, anim_data->width, -1);
+        gtk_box_pack_end(GTK_BOX(box), sw, TRUE, TRUE, 20);
+        qs_scrolled = sw;
+        g_signal_connect(sw, "scroll-event", G_CALLBACK(on_qs_scroll), NULL);
+    }
     gtk_widget_show_all(box);
     if (delete_notifications_button) {
         if (dbus_notif_store.count >= 2) {
@@ -3262,7 +3289,7 @@ static void add_notification_to_panel(GtkWidget *box, int width, int height) {
         gtk_widget_destroy(GTK_WIDGET(iter->data));
     g_list_free(notif_children);
     int n = dbus_notif_store.count;
-    int m = (n < max_notification_buttons) ? n : max_notification_buttons;
+    int m = (n < NOTIF_CENTER_MAX_SHOW) ? n : NOTIF_CENTER_MAX_SHOW;
     if (n > 0) {
         for (int i = 0; i < m; i++) {
             Notification notif;
@@ -3351,20 +3378,8 @@ static GtkWidget* create_quick_settings_panel(int width, int height __attribute_
     int button_width = (usable_width - 3 * QUICKSETTINGS_BUTTON_MARGIN) / QUICKSETTINGS_BUTTONS_PER_ROW;
     int button_height = button_width * 4 / 5;   /* 4/5 给两行文字留高度 */
     int num_rows = (num_buttons + QUICKSETTINGS_BUTTONS_PER_ROW - 1) / QUICKSETTINGS_BUTTONS_PER_ROW;
-    delete_notifications_button = gtk_button_new_with_label("Delete notifications");
-    GtkStyleContext *ctx = gtk_widget_get_style_context(delete_notifications_button);
-    gtk_style_context_add_class(ctx, "delnotifs-button");
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    gtk_widget_override_font(delete_notifications_button, panel_font_desc);
-    #pragma GCC diagnostic pop
-    gtk_widget_set_halign(delete_notifications_button, GTK_ALIGN_END);
-    gtk_widget_set_margin_end(delete_notifications_button, QUICKSETTINGS_MARGIN);
-    gtk_widget_set_margin_top(delete_notifications_button, 5);
-    gtk_widget_set_margin_bottom(delete_notifications_button, 13);
-    g_signal_connect(delete_notifications_button, "clicked", G_CALLBACK(on_delete_notifications_clicked), NULL);
-    gtk_box_pack_start(GTK_BOX(quick_settings), delete_notifications_button, FALSE, FALSE, 0);
-    gtk_widget_hide(delete_notifications_button);
+    /* ★ 控制中心不再有「Delete notifications」按钮（通知中心自己带清空按钮） */
+    delete_notifications_button = NULL;
     for (int row = 0, btn_idx = 0; row < num_rows; row++) {
         GtkWidget *button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, QUICKSETTINGS_BUTTON_MARGIN);
         gtk_widget_set_margin_start(button_row, QUICKSETTINGS_MARGIN);
@@ -3403,9 +3418,19 @@ static GtkWidget* create_quick_settings_panel(int width, int height __attribute_
         gtk_box_pack_start(GTK_BOX(quick_settings), button_row, FALSE, FALSE, 0);
     }
     GtkWidget *bottom_spacer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_size_request(bottom_spacer, -1, 20);
+    gtk_widget_set_size_request(bottom_spacer, -1, 12);
     gtk_box_pack_start(GTK_BOX(quick_settings), bottom_spacer, FALSE, FALSE, 0);
+    /* ★ 滑动条改放到独立的 qs_sliders_box（固定在面板底部，不随按钮滚动） */
     if (sidebar_flags & FLAG_BACKLIGHT_CONTROL) {
+        if (qs_sliders_box) {
+            GList *ch = gtk_container_get_children(GTK_CONTAINER(qs_sliders_box));
+            for (GList *it = ch; it; it = it->next)
+                gtk_widget_destroy(GTK_WIDGET(it->data));
+            g_list_free(ch);
+        } else {
+            qs_sliders_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+            gtk_widget_set_name(qs_sliders_box, "qs-sliders");
+        }
         GtkWidget *slider_container = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
         gtk_widget_set_margin_start(slider_container, QUICKSETTINGS_MARGIN);
         gtk_widget_set_margin_end(slider_container, QUICKSETTINGS_MARGIN);
@@ -3433,7 +3458,7 @@ static GtkWidget* create_quick_settings_panel(int width, int height __attribute_
         g_signal_connect(backlight_slider, "value-changed", G_CALLBACK(slider_changed), NULL);
         gtk_widget_set_size_request(slider_container, total_slider_width, -1);
         gtk_widget_set_halign(slider_container, GTK_ALIGN_CENTER);
-        gtk_box_pack_start(GTK_BOX(quick_settings), slider_container, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(qs_sliders_box), slider_container, FALSE, FALSE, 0);
 
         /* ===== 音量滑动条（上限 MAX_VOLUME_PCT）===== */
         GtkWidget *vol_container = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
@@ -3455,11 +3480,12 @@ static GtkWidget* create_quick_settings_panel(int width, int height __attribute_
         g_signal_connect(volume_slider, "value-changed", G_CALLBACK(volume_slider_changed), NULL);
         gtk_widget_set_size_request(vol_container, total_slider_width, -1);
         gtk_widget_set_halign(vol_container, GTK_ALIGN_CENTER);
-        gtk_box_pack_start(GTK_BOX(quick_settings), vol_container, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(qs_sliders_box), vol_container, FALSE, FALSE, 0);
 
         GtkWidget *slider_spacer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-        gtk_widget_set_size_request(slider_spacer, -1, 20);
-        gtk_box_pack_start(GTK_BOX(quick_settings), slider_spacer, FALSE, FALSE, 0);
+        gtk_widget_set_size_request(slider_spacer, -1, 16);
+        gtk_box_pack_start(GTK_BOX(qs_sliders_box), slider_spacer, FALSE, FALSE, 0);
+        gtk_widget_show_all(qs_sliders_box);
     }
     gtk_widget_show_all(quick_settings);
     return quick_settings;
@@ -3508,6 +3534,189 @@ static gboolean show_notification_popup_wrapper(gpointer user_data) {
 
 
 
+/* ★★★ 通知中心：独立的左侧面板 ★★★ */
+static GtkWidget *create_notification_center(int width, int height) {
+    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_decorated(GTK_WINDOW(win), FALSE);
+    gtk_window_set_type_hint(GTK_WINDOW(win), GDK_WINDOW_TYPE_HINT_DOCK);
+    gtk_window_set_default_size(GTK_WINDOW(win), width, height);
+    gtk_widget_set_app_paintable(win, TRUE);
+    gtk_widget_set_name(win, "transparent-window");
+
+    GdkScreen *scr = gtk_widget_get_screen(win);
+    GdkVisual *vis = gdk_screen_get_rgba_visual(scr);
+    if (vis && gdk_screen_is_composited(scr))
+        gtk_widget_set_visual(win, vis);
+
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_add(GTK_CONTAINER(win), outer);
+
+    /* 标题 */
+    GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(outer), hdr, FALSE, FALSE, 10);
+    GtkWidget *title = gtk_label_new("通知中心");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    gtk_widget_override_font(title, paneltitlefont_desc);
+#pragma GCC diagnostic pop
+    gtk_style_context_add_class(gtk_widget_get_style_context(title), "actions-center-label");
+    gtk_box_pack_start(GTK_BOX(hdr), title, FALSE, FALSE, 0);
+
+    /* 可滚动的通知列表 */
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(sw), FALSE);
+    gtk_scrolled_window_set_kinetic_scrolling(GTK_SCROLLED_WINDOW(sw), TRUE);
+    gtk_widget_set_name(sw, "nc-scrolled");
+    gtk_box_pack_start(GTK_BOX(outer), sw, TRUE, TRUE, 0);
+    nc_scrolled = sw;
+    if (notif_available_height <= 0)
+        notif_available_height = height - 120;
+
+    /* 列表容器 */
+    GtkWidget *notif_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, NOTIF_BOX_SPACING);
+    gtk_widget_set_name(notif_box, "notification-box");
+    gtk_container_add(GTK_CONTAINER(sw), notif_box);
+
+    /* 清空按钮 */
+    GtkWidget *del = gtk_button_new_with_label("清空全部通知");
+    gtk_style_context_add_class(gtk_widget_get_style_context(del), "delnotifs-button");
+    g_signal_connect(del, "clicked", G_CALLBACK(on_delete_notifications_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(outer), del, FALSE, FALSE, 10);
+
+    gtk_widget_show_all(win);
+    return win;
+}
+
+/* ★ 控制中心/通知中心滚轮事件：放大步长，触摸更顺 */
+static gboolean on_qs_scroll(GtkWidget *widget, GdkEventScroll *ev, gpointer user_data) {
+    GtkAdjustment *adj = user_data ? gtk_range_get_adjustment(GTK_RANGE(user_data))
+                                   : gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(widget));
+    if (!adj) return FALSE;
+    gdouble d = gtk_adjustment_get_value(adj);
+    gdouble lo = gtk_adjustment_get_lower(adj);
+    gdouble hi = gtk_adjustment_get_upper(adj);
+    gdouble ps = gtk_adjustment_get_page_size(adj);
+    int step = qs_scroll_step;
+    switch (ev->direction) {
+        case GDK_SCROLL_UP:    d -= step; break;
+        case GDK_SCROLL_DOWN:  d += step; break;
+        case GDK_SCROLL_SMOOTH: d += ev->delta_y * step; break;
+        default: return FALSE;
+    }
+    if (d < lo) d = lo;
+    if (d > hi - ps) d = (hi - ps > lo) ? hi - ps : lo;
+    gtk_adjustment_set_value(adj, d);
+    return TRUE;
+}
+
+/* ★ 通知中心专用动画：从左滑入 / 向左滑出 */
+static gboolean animate_notif_center(gpointer ud) {
+    AnimationData *d = (AnimationData *)ud;
+    if (!d->is_animating) return FALSE;
+    int at = render_options.anim_type;
+
+    if (at == ANIM_TYPE_NONE) {
+        if (d->is_opening) {
+            d->current_x = d->target_x;
+            gtk_window_move(GTK_WINDOW(d->window), d->current_x, d->y_position);
+            gtk_widget_set_opacity(d->window, render_options.opacity);
+            gtk_widget_show(d->window);
+        } else {
+            d->current_x = d->start_x;
+            gtk_widget_hide(d->window);
+        }
+        d->is_animating = FALSE;
+        return FALSE;
+    }
+
+    if (at == ANIM_TYPE_FADE) {
+        const float fs = 0.02f;
+        if (d->is_opening) {
+            if (d->current_x != d->target_x) {
+                d->current_x = d->target_x;
+                gtk_window_move(GTK_WINDOW(d->window), d->current_x, d->y_position);
+            }
+            if (d->current_opacity < d->target_opacity - fs)
+                d->current_opacity += fs;
+            else { d->current_opacity = d->target_opacity; d->is_animating = FALSE; }
+            gtk_widget_set_opacity(d->window, d->current_opacity);
+        } else {
+            if (d->current_opacity > fs)
+                d->current_opacity -= fs;
+            else {
+                d->current_opacity = 0.0;
+                d->is_animating = FALSE;
+                gtk_widget_hide(d->window);
+            }
+            gtk_widget_set_opacity(d->window, d->current_opacity);
+        }
+        return d->is_animating ? TRUE : FALSE;
+    }
+
+    /* SLIDE / SLFD：通知中心方向与主面板相反（从左进） */
+    if (d->is_opening) {
+        /* start_x(-width) → target_x(0)，向右推进 */
+        if (d->current_x < d->target_x - 5) {
+            d->current_x += d->pas_anim;
+            if (d->current_x > d->target_x) d->current_x = d->target_x;
+        } else {
+            d->current_x = d->target_x;
+            d->is_animating = FALSE;
+        }
+        gtk_window_move(GTK_WINDOW(d->window), d->current_x, d->y_position);
+        if (at == ANIM_TYPE_SLFD) {
+            const float fs = 0.02f;
+            if (d->current_opacity < d->target_opacity - fs)
+                d->current_opacity += fs;
+            else d->current_opacity = d->target_opacity;
+            gtk_widget_set_opacity(d->window, d->current_opacity);
+        }
+    } else {
+        /* target_x(0) → start_x(-width)，向左退出 */
+        if (d->current_x > d->start_x + 5) {
+            d->current_x -= d->pas_hide;
+            if (d->current_x < d->start_x) d->current_x = d->start_x;
+        } else {
+            d->current_x = d->start_x;
+            d->is_animating = FALSE;
+            gtk_widget_hide(d->window);
+        }
+        gtk_window_move(GTK_WINDOW(d->window), d->current_x, d->y_position);
+        if (at == ANIM_TYPE_SLFD) {
+            const float fs = 0.02f;
+            if (d->current_opacity > fs) d->current_opacity -= fs;
+            else d->current_opacity = 0.0;
+            gtk_widget_set_opacity(d->window, d->current_opacity);
+        }
+    }
+    return d->is_animating ? TRUE : FALSE;
+}
+
+/* ★ 驱动通知中心滑入/滑出（与控制中心同步） */
+static void toggle_notif_center(int show) {
+    if (!notif_center_data || notif_center_data->is_animating) return;
+    if (show && notif_center_data->is_opening) return;
+    if (!show && !notif_center_data->is_opening) return;
+
+    AnimationData *nc = notif_center_data;
+    if (show) {
+        regenerate_notifications(nc->window);
+        nc->current_x = nc->start_x;
+        nc->target_x = nc->workarea.x;
+        nc->is_animating = TRUE;
+        nc->is_opening = TRUE;
+        gtk_window_move(GTK_WINDOW(nc->window), nc->current_x, nc->y_position);
+        gtk_widget_show_all(nc->window);
+    } else {
+        nc->target_x = nc->start_x;
+        nc->is_animating = TRUE;
+        nc->is_opening = FALSE;
+    }
+    g_timeout_add(8, animate_notif_center, nc);
+}
+
 void handle_signal(int signum) {
     if (anim_data == NULL) return;
     if (signum == SIGHUP) {
@@ -3524,6 +3733,27 @@ if (status_icon && !(sidebar_flags & FLAG_TRINITY_APPLET)) {
             gtk_main_quit();
         } else {
             restart_requested = 1;
+        }
+    } else if (signum == SIGUSR2) {
+        /* ★ 切换左侧通知中心 */
+        if (notif_center_data && !notif_center_data->is_animating) {
+            regenerate_notifications(notif_center_data->window);
+            if (!notif_center_data->is_opening) {
+                notif_center_data->current_x = notif_center_data->start_x;
+                notif_center_data->target_x = notif_center_data->workarea.x;
+                notif_center_data->is_animating = TRUE;
+                notif_center_data->is_opening = TRUE;
+                gtk_window_move(GTK_WINDOW(notif_center_data->window),
+                                notif_center_data->current_x,
+                                notif_center_data->y_position);
+                gtk_widget_show_all(notif_center_data->window);
+                g_timeout_add(8, animate_notif_center, notif_center_data);
+            } else {
+                notif_center_data->target_x = notif_center_data->start_x;
+                notif_center_data->is_animating = TRUE;
+                notif_center_data->is_opening = FALSE;
+                g_timeout_add(8, animate_notif_center, notif_center_data);
+            }
         }
     } else if (signum == SIGUSR1) {
         if (!anim_data->is_animating) {
@@ -3594,6 +3824,8 @@ if (status_icon && !(sidebar_flags & FLAG_TRINITY_APPLET)) {
                     regenerate_notifications(anim_data->window);
                     anim_data->update_pending = FALSE;
                 }
+                /* ★ 通知中心同步从左滑入 */
+                toggle_notif_center(1);
             } else {
                 if (anim_data->is_project_panel) {
                     update_systray_icon();
@@ -3613,6 +3845,8 @@ if (status_icon && !(sidebar_flags & FLAG_TRINITY_APPLET)) {
                         recreate_original_buttons(NULL);
                         anim_data->is_project_panel = FALSE;
                     }
+                    /* ★ 通知中心同步滑出 */
+                    toggle_notif_center(0);
                 } else {
                     if (render_options.anim_type == ANIM_TYPE_SLIDE) {
                         anim_data->target_x = anim_data->start_x;
@@ -3628,6 +3862,8 @@ if (status_icon && !(sidebar_flags & FLAG_TRINITY_APPLET)) {
                         recreate_original_buttons(NULL);
                         anim_data->is_project_panel = FALSE;
                     }
+                    /* ★ 通知中心同步滑出 */
+                    toggle_notif_center(0);
                     g_timeout_add(8, animate_window, anim_data);
                 }
             }
@@ -3753,19 +3989,25 @@ int custom_ceil(float value) {
 
 
 
+/* ★ 递归查找指定名字的 widget（通知中心是嵌套结构） */
+static GtkWidget *find_widget_by_name(GtkWidget *root, const char *name) {
+    if (!root || !GTK_IS_WIDGET(root)) return NULL;
+    const gchar *n = gtk_widget_get_name(root);
+    if (n && strcmp(n, name) == 0) return root;
+    if (!GTK_IS_CONTAINER(root)) return NULL;
+    GList *ch = gtk_container_get_children(GTK_CONTAINER(root));
+    GtkWidget *found = NULL;
+    for (GList *it = ch; it; it = it->next) {
+        found = find_widget_by_name(GTK_WIDGET(it->data), name);
+        if (found) break;
+    }
+    g_list_free(ch);
+    return found;
+}
+
 static void regenerate_notifications(GtkWidget *window) {
     GtkWidget *box = gtk_bin_get_child(GTK_BIN(window));
-    GList *children = gtk_container_get_children(GTK_CONTAINER(box));
-    GtkWidget *notif_box = NULL;
-    for (GList *iter = children; iter != NULL; iter = iter->next) {
-        GtkWidget *child = GTK_WIDGET(iter->data);
-        const gchar *name = gtk_widget_get_name(child);
-        if (name && strcmp(name, "notification-box") == 0) {
-            notif_box = child;
-            break;
-        }
-    }
-    g_list_free(children);
+    GtkWidget *notif_box = find_widget_by_name(box, "notification-box");
     if (!notif_box) return;
     GList *notif_children = gtk_container_get_children(GTK_CONTAINER(notif_box));
     for (GList *iter = notif_children; iter != NULL; iter = iter->next) {
@@ -3792,7 +4034,10 @@ static void regenerate_notifications(GtkWidget *window) {
     }
     if (notif_count > 0) {
         qsort(notifications, notif_count, sizeof(Notification), compare_notifications);
-        int display_count = (notif_count < max_notification_buttons) ? notif_count : max_notification_buttons;
+        /* ★ 通知中心有滚动条，全显示；控制中心按高度限制 */
+        int limit = (notif_center_data && window == notif_center_data->window)
+                    ? NOTIF_CENTER_MAX_SHOW : max_notification_buttons;
+        int display_count = (notif_count < limit) ? notif_count : limit;
         int hidden_count = notif_count - display_count;
         time_t now = time(NULL);
         struct tm tm_now;
@@ -3938,6 +4183,8 @@ static gboolean on_click_outside(GtkWidget *widget __attribute__((unused)), GdkE
             anim_data->is_project_panel = FALSE;
         }
         g_timeout_add(8, animate_window, anim_data);
+        /* ★ 通知中心同步收起 */
+        toggle_notif_center(0);
         if (anim_data->click_window) {
             gtk_widget_hide(anim_data->click_window);
         }
@@ -4190,7 +4437,7 @@ static void main_sidebar(void) {
     }
 //
     int font_size = pango_font_description_get_size(panel_font_desc) / PANGO_SCALE;
-    int delete_button_height = font_size * 1.2 + 5 + 24;
+    int delete_button_height = 0;   /* ★ 控制中心已无删除按钮 */
     int slider_height = (sidebar_flags & FLAG_BACKLIGHT_CONTROL) ? 40 : 0;
     int header_height = 30;
     int num_rows = (num_buttons + QUICKSETTINGS_BUTTONS_PER_ROW - 1) / QUICKSETTINGS_BUTTONS_PER_ROW;
@@ -4244,11 +4491,26 @@ static void main_sidebar(void) {
     #pragma GCC diagnostic pop
     gtk_style_context_add_class(gtk_widget_get_style_context(label), "actions-center-label");
     gtk_box_pack_start(GTK_BOX(header_box), label, FALSE, FALSE, 0);
-    add_notification_to_panel(box, width, notif_height);
-    GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_box_pack_start(GTK_BOX(box), spacer, TRUE, TRUE, 0);
+    /* ★ 通知区已移到独立的通知中心窗口，控制中心不再留白 */
     GtkWidget *quick_settings = create_quick_settings_panel(width, notif_height);
-    gtk_box_pack_end(GTK_BOX(box), quick_settings, FALSE, FALSE, bottom_margin);
+    /* ★ 滑动条固定区（不滚动）先 pack_end，保证贴底 */
+    if (qs_sliders_box) {
+        gtk_box_pack_end(GTK_BOX(box), qs_sliders_box, FALSE, FALSE, 0);
+    }
+    /* ★ 只有按钮区可滚动 */
+    {
+        GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sw),
+                                       GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(sw), FALSE);
+        gtk_scrolled_window_set_kinetic_scrolling(GTK_SCROLLED_WINDOW(sw), TRUE);
+        gtk_widget_set_name(sw, "qs-scrolled");
+        gtk_container_add(GTK_CONTAINER(sw), quick_settings);
+        gtk_widget_set_size_request(sw, width, -1);
+        gtk_box_pack_end(GTK_BOX(box), sw, TRUE, TRUE, main_box_spacing);
+        qs_scrolled = sw;
+        g_signal_connect(sw, "scroll-event", G_CALLBACK(on_qs_scroll), NULL);
+    }
     GtkWidget *click_window = NULL;
     switch (transparent_click_type) {
         case 0: notif_type_hint = GDK_WINDOW_TYPE_HINT_DOCK; break;
@@ -4275,9 +4537,12 @@ static void main_sidebar(void) {
             gtk_widget_set_visual(click_window, visual);
         }
         gtk_widget_set_opacity(click_window, 0.0);
-        int click_window_width = ((sidebar_flags & FLAG_EXTEND_MODE) ? total_display_width : workarea.width) - width;
+        /* ★ 点击层只覆盖两个中心之间的中间区域，不压到通知中心（左边 width 宽） */
+        int screen_w = (sidebar_flags & FLAG_EXTEND_MODE) ? total_display_width : workarea.width;
+        int click_window_width = screen_w - 2 * width;
+        if (click_window_width < 10) click_window_width = 10;
         gtk_window_set_default_size(GTK_WINDOW(click_window), click_window_width, workarea.height);
-        gtk_window_move(GTK_WINDOW(click_window), workarea.x, workarea.y);
+        gtk_window_move(GTK_WINDOW(click_window), workarea.x + width, workarea.y);
         GtkWidget *click_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         gtk_container_add(GTK_CONTAINER(click_window), click_box);
         g_signal_connect(click_window, "button-press-event", G_CALLBACK(on_click_outside), NULL);
@@ -4302,11 +4567,39 @@ static void main_sidebar(void) {
     anim_data->current_opacity = 1.0;
     anim_data->target_opacity = 1.0;
     anim_data->update_pending = FALSE;
+    anim_data->is_notif_center = FALSE;
     gtk_widget_set_opacity(window, 1.0);
     g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), NULL);
     g_signal_connect(window, "draw", G_CALLBACK(on_draw), NULL);
  update_window_sizes(anim_data);
     gtk_widget_show_all(window);
+
+    /* ★★★ 创建左侧通知中心窗口 ★★★ */
+    {
+        GtkWidget *ncwin = create_notification_center(width, window_height);
+        notif_center_data = g_new0(AnimationData, 1);
+        notif_center_data->window = ncwin;
+        notif_center_data->click_window = NULL;
+        notif_center_data->workarea = workarea;
+        notif_center_data->width = width;
+        notif_center_data->height = window_height;
+        notif_center_data->start_x = -width;               /* 左边界外 */
+        notif_center_data->target_x = workarea.x;          /* 贴左边 */
+        notif_center_data->current_x = -width;
+        notif_center_data->y_position = workarea.y;
+        notif_center_data->pas_anim = pas_anim;
+        notif_center_data->pas_hide = pas_hide;
+        notif_center_data->current_opacity = 1.0;
+        notif_center_data->target_opacity = 1.0;
+        notif_center_data->is_animating = FALSE;
+        notif_center_data->is_opening = FALSE;
+        notif_center_data->is_project_panel = FALSE;
+        notif_center_data->update_pending = FALSE;
+        notif_center_data->is_notif_center = TRUE;
+        gtk_window_move(GTK_WINDOW(ncwin), -width, workarea.y);
+        gtk_widget_hide(ncwin);
+        g_signal_connect(ncwin, "draw", G_CALLBACK(on_draw), NULL);
+    }
     gtk_main();
     cleanup_sidebar();
 }
@@ -5122,6 +5415,7 @@ int main(int argc, char *argv[]) {
     GdkScreen *screen = gdk_screen_get_default();
     g_signal_connect(screen, "size-changed", G_CALLBACK(on_screen_size_changed), NULL);
     signal(SIGUSR1, handle_signal); //toggle panel visibility
+    signal(SIGUSR2, handle_signal); //toggle notification center
     signal(SIGUSR2, handle_signal); //close panel if opened
     signal(SIGHUP, handle_signal); //reload config file
     //trinity applet specific
