@@ -11,6 +11,7 @@ if [ -z "$ANALOG" ] || [ -z "$DIGITAL" ]; then
 fi
 ANALOG=${ANALOG:-1}
 DIGITAL=${DIGITAL:-300}
+ALWAYS_ON=${ALWAYS_ON:-"1 3"}
 
 CARD=0
 [ -f /proc/asound/card0/id ] || { echo "q706f-audio: 声卡 0 不存在" >&2; exit 1; }
@@ -61,5 +62,10 @@ for n in 1 2 3 4 5 6 7 8; do
     amixer -c $CARD sset "PRIMARY_TDM_RX_0 Audio Mixer MultiMedia$n" on >/dev/null 2>&1
 done
 
-echo "q706f-audio: Analog=$ANALOG Digital=$DIGITAL 已应用"
+# 常开的功放（不等播放器）
+for spk in $ALWAYS_ON; do
+    amixer -c $CARD sset "SPK${spk} AMP Enable" on >/dev/null 2>&1
+done
+
+echo "q706f-audio: Analog=$ANALOG Digital=$DIGITAL 常开=[$ALWAYS_ON] 已应用"
 exit 0

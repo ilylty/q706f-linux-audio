@@ -466,6 +466,13 @@ typedef struct {
     unsigned int _unused          : 4;
 } ButtonConfig;
 
+/* ===== q706f 补丁：前向声明 ===== */
+static gboolean update_button_label(gpointer data);
+static void start_label_timer(ButtonConfig *cfg);
+static int  get_volume_percentage(void);
+static void set_volume_percentage(double value);
+static void volume_slider_changed(GtkRange *range, gpointer user_data);
+
 
 ButtonConfig button_configs[MAX_BUTTONS];
 int num_buttons = 0;

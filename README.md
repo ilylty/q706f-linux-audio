@@ -86,6 +86,51 @@ cp /mnt/vend/firmware/SPK1-cs35l45-dsp1-spk-prot.wmfw /lib/firmware/cirrus/cs35l
 cp /mnt/vend/firmware/SPK1-cs35l45-dsp1-spk-prot.bin  /lib/firmware/cirrus/cs35l45-dsp1-spk-prot.bin
 ```
 
+### 坑 2.5：pipewire 默认 S24_LE，TDM 通路无声
+
+**症状**：`aplay -D hw:0,0` 直连有声音，`paplay` / Firefox 走 pipewire **完全没声音**，但 sink 状态是 `RUNNING`、无任何报错。
+
+**原因**：pipewire 的 SPA ALSA 用 **MMAP** 打开设备，**绕过 ALSA 的格式协商**。它挑了 `S24_LE`：
+
+```
+Sample Specification: s24-32le 2ch 48000Hz
+hw_params: format: S24_LE
+```
+
+但这个声卡**硬件只支持 S16_LE**，用 `aplay` 手动指定会看到：
+
+```
+$ aplay -D hw:0,0 -f S24_LE ...
+Warning: format is changed to S16_LE
+$ aplay -D hw:0,0 -f S32_LE ...
+Warning: format is changed to S16_LE
+```
+
+**MMAP 下发 S24_LE 时硬件不报错，但 TDM 总路上的数据位错位，DSP 读到的是垃圾 → 静音。**
+
+**修复**：强制 pipewire 用 S16_LE。
+
+```ini
+# /etc/wireplumber/wireplumber.conf.d/51-q706f-s16.conf
+monitor.alsa.rules = [
+  {
+    matches = [ { node.name = "~alsa_output.*" } ]
+    actions = {
+      update-props = {
+        audio.format = "S16LE"
+        audio.rate = 48000
+        audio.channels = 2
+        audio.position = "FL,FR"
+      }
+    }
+  }
+]
+```
+
+改完 `systemctl --user restart pipewire wireplumber`，sink 会变成 `s16le 2ch 48000Hz`。
+
+**验证是否格式问题**：播放时看 `/proc/asound/card0/pcm0p/sub0/hw_params` 里的 `format:` 字段。
+
 ### 坑 3：满增益四喇叭会拉垮电池 → 黑屏死机
 
 **血泪教训**：把 `Analog PCM` 设成 3（19 dB）+ `Digital PCM` 设成 409（0 dB），四个功放一起响，**电池 3.89 V 时直接触发 PMIC 欠压保护，屏幕瞬间黑掉**。
@@ -118,8 +163,9 @@ sudo ./install.sh
 3. 安装 `/etc/q706f-audio/speakers.conf`（可编辑音量）
 4. 安装 `/etc/systemd/system/q706f-audio.service` 并 enable
 5. 安装简化版 UCM 到 `/usr/share/alsa/ucm2/Lenovo/q706f/`
-6. mask 掉会被 HALO_STATE 卡住的 `alsa-restore.service`
-7. 给 pipewire 的 systemd 单元加 `ConditionUser=` override（root 身份必需）
+6. **安装 `/etc/wireplumber/wireplumber.conf.d/51-q706f-s16.conf`（强制 S16_LE）**
+7. mask 掉会被 HALO_STATE 卡住的 `alsa-restore.service`
+8. 给 pipewire 的 systemd 单元加 `ConditionUser=` override（root 身份必需）
 
 ---
 
@@ -141,6 +187,23 @@ sudo q706f-audio-setup 1 350    # Analog=1, Digital=350
 ```
 
 **建议的调整顺序**：先把 `DIGITAL` 一格一格加到 350、380，**最后才动 `ANALOG`**。
+
+### 常开的功放
+
+```ini
+ALWAYS_ON="2 4"     # 留空则 4 个都只在播放时开
+```
+
+**物理箱体编号和软件编号是交叉的**（从 DSP 固件加载日志可见）：
+
+| DTS prefix | I²C | 物理箱体 |
+|---|---|---|
+| SPK1 | `5-0030` | BOX1 MUSIC |
+| SPK2 | `5-0031` | BOX2 MUSIC |
+| **SPK3** | `5-0036` | **BOX4 music** |
+| **SPK4** | `5-0037` | **BOX3 MUSIC** |
+
+所以“左右各一个”不能简单按 SPK1+SPK3 配，需要按 BOX 编号对应。
 
 **桌面控制中心的音量条上限锁在 70%**（qsidebar 补丁 `MAX_VOLUME_PCT`），这是软件层；硬件层 `Analog` 和 `Digital` 是固定的，两道闸门互不冲突。
 

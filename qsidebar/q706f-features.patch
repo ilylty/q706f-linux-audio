@@ -1,5 +1,5 @@
 --- qsidebar.c.orig	2026-10-29 16:22:10.643067030 +0000
-+++ qsidebar.c	2026-10-29 16:21:26.000000000 +0000
++++ qsidebar.c	2026-10-29 16:36:48.631066695 +0000
 @@ -242,6 +242,13 @@
  
  static BacklightInfo backlight_info = {NULL, 0, 0};
@@ -25,7 +25,21 @@
      char confirm_text[MAX_LINE_LENGTH];
      GtkWidget *button;                // 8 octets
      unsigned int confirm_cmd      : 1;
-@@ -1642,6 +1653,10 @@
+@@ -455,6 +466,13 @@
+     unsigned int _unused          : 4;
+ } ButtonConfig;
+ 
++/* ===== q706f 补丁：前向声明 ===== */
++static gboolean update_button_label(gpointer data);
++static void start_label_timer(ButtonConfig *cfg);
++static int  get_volume_percentage(void);
++static void set_volume_percentage(double value);
++static void volume_slider_changed(GtkRange *range, gpointer user_data);
++
+ 
+ ButtonConfig button_configs[MAX_BUTTONS];
+ int num_buttons = 0;
+@@ -1642,6 +1660,10 @@
          button_configs[i].icon_path[0] = '\0';
          button_configs[i].cmd[0] = '\0';
          button_configs[i].initstate_cmd[0] = '\0';
@@ -36,7 +50,7 @@
          button_configs[i].confirm_cmd = FALSE;
          button_configs[i].confirm_text[0] = '\0';
          button_configs[i].button = NULL;
-@@ -2181,6 +2196,14 @@
+@@ -2181,6 +2203,14 @@
          }
      } else if (strcmp(property, "cmd") == 0) {
          strncpy(button_configs[button_idx].cmd, value, MAX_LINE_LENGTH - 1);
@@ -51,7 +65,7 @@
      } else if (strcmp(property, "initstate_cmd") == 0) {
          strncpy(button_configs[button_idx].initstate_cmd, value, MAX_LINE_LENGTH - 1);
      } else if (strcmp(property, "confirm_cmd") == 0) {
-@@ -2874,7 +2897,13 @@
+@@ -2874,7 +2904,13 @@
                          gtk_widget_override_font(second_label, quickbuttons_font_desc);
                          #pragma GCC diagnostic pop
                          gtk_widget_set_halign(second_label, GTK_ALIGN_START);
@@ -65,7 +79,7 @@
                      } else {
                          GtkWidget *label = gtk_label_new(config->name);
                          #pragma GCC diagnostic push
-@@ -2882,7 +2911,13 @@
+@@ -2882,7 +2918,13 @@
                          gtk_widget_override_font(label, quickbuttons_font_desc);
                          #pragma GCC diagnostic pop
                          gtk_widget_set_halign(label, GTK_ALIGN_START);
@@ -79,7 +93,7 @@
                      }
                  }
                  if (scaled_pixbuf)
-@@ -2898,6 +2933,10 @@
+@@ -2898,6 +2940,10 @@
          gtk_style_context_add_class(gtk_widget_get_style_context(button), "original-button");
      }
      gtk_widget_set_size_request(button, button_width, button_height);
@@ -90,7 +104,7 @@
      return button;
  }
  
-@@ -3303,7 +3342,7 @@
+@@ -3303,7 +3349,7 @@
      GtkWidget *quick_settings = gtk_box_new(GTK_ORIENTATION_VERTICAL, QUICKSETTINGS_BUTTON_MARGIN);
      int usable_width = width - 2 * QUICKSETTINGS_MARGIN;
      int button_width = (usable_width - 3 * QUICKSETTINGS_BUTTON_MARGIN) / QUICKSETTINGS_BUTTONS_PER_ROW;
@@ -99,7 +113,7 @@
      int num_rows = (num_buttons + QUICKSETTINGS_BUTTONS_PER_ROW - 1) / QUICKSETTINGS_BUTTONS_PER_ROW;
      delete_notifications_button = gtk_button_new_with_label("Delete notifications");
      GtkStyleContext *ctx = gtk_widget_get_style_context(delete_notifications_button);
-@@ -3346,13 +3385,13 @@
+@@ -3346,13 +3392,13 @@
                      }
                  }
                  g_signal_connect(button, "clicked", G_CALLBACK(on_button_clicked), config);
@@ -115,7 +129,7 @@
          }
          gtk_box_pack_start(GTK_BOX(quick_settings), button_row, FALSE, FALSE, 0);
      }
-@@ -3388,6 +3427,29 @@
+@@ -3388,6 +3434,29 @@
          gtk_widget_set_size_request(slider_container, total_slider_width, -1);
          gtk_widget_set_halign(slider_container, GTK_ALIGN_CENTER);
          gtk_box_pack_start(GTK_BOX(quick_settings), slider_container, FALSE, FALSE, 0);
@@ -145,7 +159,7 @@
          GtkWidget *slider_spacer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
          gtk_widget_set_size_request(slider_spacer, -1, 20);
          gtk_box_pack_start(GTK_BOX(quick_settings), slider_spacer, FALSE, FALSE, 0);
-@@ -4127,7 +4189,7 @@
+@@ -4127,7 +4196,7 @@
      int num_rows = (num_buttons + QUICKSETTINGS_BUTTONS_PER_ROW - 1) / QUICKSETTINGS_BUTTONS_PER_ROW;
      int usable_width = width - 2 * QUICKSETTINGS_MARGIN;
      int button_width = (usable_width - 3 * QUICKSETTINGS_BUTTON_MARGIN) / QUICKSETTINGS_BUTTONS_PER_ROW;
@@ -154,7 +168,7 @@
      int button_rows_height = num_rows * button_height + (num_rows > 1 ? (num_rows - 1) * QUICKSETTINGS_BUTTON_MARGIN : 0);
      int main_box_spacing = 20;
      int slider_bottom_margin = (sidebar_flags & FLAG_BACKLIGHT_CONTROL) ? 20 : 0;
-@@ -4711,12 +4773,79 @@
+@@ -4711,12 +4780,79 @@
  
  
  

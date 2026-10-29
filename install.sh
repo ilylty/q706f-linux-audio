@@ -122,6 +122,14 @@ fi
 
 # ---------------------------------------------------------------- 5. pipewire
 if [ "$SKIP_PW" -eq 0 ]; then
+    step "配置 wireplumber（强制 S16_LE）"
+
+    WPD=/etc/wireplumber/wireplumber.conf.d
+    mkdir -p "$WPD"
+    install -m644 "$REPO_DIR/files/etc/wireplumber/wireplumber.conf.d/51-q706f-s16.conf" \
+        "$WPD/51-q706f-s16.conf"
+    ok "$WPD/51-q706f-s16.conf（TDM 通路只接受 16 位）"
+
     step "配置 pipewire（root 下需要去掉 ConditionUser=!root）"
 
     for u in pipewire.service pipewire.socket pipewire-pulse.service wireplumber.service; do
