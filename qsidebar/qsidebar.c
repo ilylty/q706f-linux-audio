@@ -53,9 +53,43 @@
 #define MAX_LINE 200
 #define SIG_DBUS_NOTIF 1000
 #define MAX_FILTERS 20
-#define QUICKSETTINGS_MARGIN           10
-#define QUICKSETTINGS_BUTTON_MARGIN    5
 #define QUICKSETTINGS_BUTTONS_PER_ROW  4
+
+/*
+ * 面板全部尺寸按「屏幕宽度的百分比」推导，不用固定像素。
+ *
+ * 设计基准（以面板宽度 W 为 1.0）：
+ *   面板宽 W            = 屏幕宽 / PANEL_W_DIVISOR
+ *   网格外边距          = W × MARGIN_RATIO
+ *   按钮间隙            = W × GAP_RATIO
+ *   按钮宽              = (W - 2×外边距 - 3×间隙) / 4
+ *   按钮高              = 按钮宽 × BUTTON_ASPECT
+ *   标签最大字符数      = 由按钮宽反推，见 chars_for_width()
+ *
+ * 这样在 2560 / 1920 / 1280 各种屏上都自动等比，不会出现
+ * 「第四列被挤出屏幕」这种越界问题。
+ */
+#define PANEL_W_DIVISOR      4.5f     /* 屏宽 / 面板宽（逻辑坐标） */
+#define MARGIN_RATIO         0.017f   /* 网格外边距 / 面板宽 */
+#define GAP_RATIO            0.008f   /* 按钮间隙 / 面板宽 */
+#define BUTTON_ASPECT        0.80f    /* 按钮高 / 按钮宽 */
+#define LABEL_MAX_CHARS      8        /* 标签宽度上限（字符数） */
+#define LABEL_MAX_LINES      2        /* 标签最多行数 */
+#define ICON_RATIO           0.25f    /* 图标宽 / 按钮宽 */
+#define ICON_MARGIN_RATIO    0.075f   /* 图标左右边距 / 按钮宽 */
+
+/* 由面板宽度推导各部分尺寸 */
+static inline int panel_margin_for(int panel_w)
+{
+    int m = (int)(panel_w * MARGIN_RATIO + 0.5f);
+    return m < 2 ? 2 : m;
+}
+
+static inline int panel_gap_for(int panel_w)
+{
+    int g = (int)(panel_w * GAP_RATIO + 0.5f);
+    return g < 1 ? 1 : g;
+}
 #define NOTIF_BOX_SPACING 5
 #define NOTIF_LABEL_WIDTH 24
 
@@ -492,6 +526,155 @@ NotifFilter notif_filters[MAX_FILTERS];
 
 
 
+/* ═══════════════════════════════════════════════════════════════════════
+ *  FixClip —— 尺寸硬锁容器
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * 为什么需要它：
+ *
+ *   GTK 计算窗口最小尺寸时，会把所有子控件的 get_preferred_width()
+ *   求和。GtkLabel 贡献的是「最长不可断片段」宽度（例如 "310mA"），
+ *   四列叠加就把面板顶宽，第四列被挤出屏幕右边缘。
+ *
+ *   gtk_widget_set_size_request() 只是设「最小」，是下限不是上限，
+ *   子控件申请更大时照样被采纳——所以压不住。
+ *
+ *   GtkScrolledWindow / GtkFixed / geometry hints 全部无效，
+ *   因为它们的 minimum 依然来自子控件。
+ *
+ * FixClip 的做法：
+ *
+ *   get_preferred_width / _height 直接返回固定值，绝不询问子控件；
+ *   size_allocate 把子控件强制布局到固定尺寸（子控件想多大都不管）；
+ *   draw 用 cairo 裁剪，万一有控件越界也不会画到面板外面。
+ *
+ * 这样窗口的最小尺寸与内容彻底解耦，宽度永远等于设定值。
+ */
+typedef struct {
+    GtkBin parent;
+    int fixed_width;
+    int fixed_height;
+} FixClip;
+
+typedef struct {
+    GtkBinClass parent_class;
+} FixClipClass;
+
+G_DEFINE_TYPE(FixClip, fixclip, GTK_TYPE_BIN)
+
+static void fixclip_get_preferred_width(GtkWidget *widget, gint *min_w, gint *nat_w)
+{
+    FixClip *self = (FixClip *)widget;
+    if (min_w) *min_w = self->fixed_width;
+    if (nat_w) *nat_w = self->fixed_width;
+}
+
+static void fixclip_get_preferred_height(GtkWidget *widget, gint *min_h, gint *nat_h)
+{
+    FixClip *self = (FixClip *)widget;
+    if (min_h) *min_h = self->fixed_height;
+    if (nat_h) *nat_h = self->fixed_height;
+}
+
+static void fixclip_get_preferred_width_for_height(GtkWidget *widget, gint height,
+                                                   gint *min_w, gint *nat_w)
+{
+    (void)height;
+    fixclip_get_preferred_width(widget, min_w, nat_w);
+}
+
+static void fixclip_get_preferred_height_for_width(GtkWidget *widget, gint width,
+                                                   gint *min_h, gint *nat_h)
+{
+    (void)width;
+    fixclip_get_preferred_height(widget, min_h, nat_h);
+}
+
+static void fixclip_size_allocate(GtkWidget *widget, GtkAllocation *allocation)
+{
+    FixClip *self = (FixClip *)widget;
+    gtk_widget_set_allocation(widget, allocation);
+
+    GtkWidget *child = gtk_bin_get_child(GTK_BIN(widget));
+    if (child && gtk_widget_get_visible(child)) {
+        /*
+         * 强制子控件使用固定尺寸。注意用 fixed_width 而不是
+         * allocation->width：即便 WM 给了更大的窗口，内容区仍是
+         * 设计的宽度，不会因为多出来的像素而变形。
+         */
+        GtkAllocation ca;
+        ca.x = 0;
+        ca.y = 0;
+        ca.width  = self->fixed_width  > 0 ? self->fixed_width  : allocation->width;
+        ca.height = self->fixed_height > 0 ? self->fixed_height : allocation->height;
+        gtk_widget_size_allocate(child, &ca);
+    }
+}
+
+static gboolean fixclip_draw(GtkWidget *widget, cairo_t *cr)
+{
+    GtkAllocation alloc;
+    gtk_widget_get_allocation(widget, &alloc);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, 0, 0, alloc.width, alloc.height);
+    cairo_clip(cr);
+
+    GtkWidget *child = gtk_bin_get_child(GTK_BIN(widget));
+    if (child && gtk_widget_get_visible(child) && gtk_cairo_should_draw_window(cr, gtk_widget_get_window(widget)))
+        gtk_container_propagate_draw(GTK_CONTAINER(widget), child, cr);
+
+    cairo_restore(cr);
+    return TRUE;   /* 已自行处理子控件绘制，不再交给 GtkBin */
+}
+
+static void fixclip_class_init(FixClipClass *klass)
+{
+    GtkWidgetClass *wc = GTK_WIDGET_CLASS(klass);
+    wc->get_preferred_width           = fixclip_get_preferred_width;
+    wc->get_preferred_height          = fixclip_get_preferred_height;
+    wc->get_preferred_width_for_height = fixclip_get_preferred_width_for_height;
+    wc->get_preferred_height_for_width = fixclip_get_preferred_height_for_width;
+    wc->size_allocate                 = fixclip_size_allocate;
+    wc->draw                          = fixclip_draw;
+}
+
+static void fixclip_init(FixClip *self)
+{
+    self->fixed_width  = 0;
+    self->fixed_height = 0;
+    gtk_widget_set_has_window(GTK_WIDGET(self), FALSE);
+}
+
+static GtkWidget *fixclip_new(int width, int height)
+{
+    FixClip *self = g_object_new(fixclip_get_type(), NULL);
+    self->fixed_width  = width;
+    self->fixed_height = height;
+    gtk_widget_set_size_request(GTK_WIDGET(self), width, height);
+    return GTK_WIDGET(self);
+}
+
+/*
+ * 取面板的内容根容器。
+ *
+ * 为了硬裁剪宽度，window 的直接子控件是 FixClip，真正的垂直 GtkBox
+ * 在它里面。所有原本用 gtk_bin_get_child(GTK_BIN(window)) 的地方
+ * 都要改用这个函数，否则拿到的会是 FixClip 而不是 box。
+ */
+static GtkWidget *panel_content_root(GtkWidget *window)
+{
+    if (!window || !GTK_IS_WINDOW(window)) return NULL;
+    GtkWidget *child = gtk_bin_get_child(GTK_BIN(window));
+    if (!child) return NULL;
+    /* window 的直接子控件是 FixClip（GtkBin），真正的 box 在它里面 */
+    if (G_TYPE_CHECK_INSTANCE_TYPE(child, fixclip_get_type())) {
+        GtkWidget *inner = gtk_bin_get_child(GTK_BIN(child));
+        if (inner) return inner;
+    }
+    return child;
+}
+
 AnimationData *anim_data = NULL;
 /* ★ 通知中心独立窗口 */
 static AnimationData *notif_center_data = NULL;
@@ -616,6 +799,30 @@ if (sidebar_flags & FLAG_ROUNDEDBUTTONS) {
             }
         }
     }
+    /*
+     * ★ 第 3 层兜底：禁止任何标签把容器撑大
+     *
+     * GTK 的 minimum size 计算里，GtkLabel 会贡献「最长不可断片段」宽度
+     * （例如 "310mA"），4 列叠加就把面板顶宽。
+     *
+     * CSS 的 min-width 优先级高于 natural size request，这里对所有
+     * 面板内的 label 设 min-width:0，让它可以被压缩到格子宽度内。
+     * 配合 ellipsize 与 line-wrap，文字会被裁剪/换行而不是撑宽。
+     */
+    g_string_append(out,
+        " .original-button label,"
+        " .active-toggle label,"
+        " qsidebar-window label,"
+        " window label {"
+        "   min-width: 0;"
+        " }"
+        " .original-button {"
+        "   min-width: 0;"
+        " }"
+        " .original-button > box {"
+        "   min-width: 0;"
+        " }");
+
     return g_string_free(out, FALSE);
 }
 
@@ -2286,7 +2493,7 @@ gboolean recreate_original_buttons(gpointer user_data __attribute__((unused))) {
         return FALSE;
     }
     GtkWidget *window = anim_data->window;
-    GtkWidget *box = gtk_bin_get_child(GTK_BIN(window));
+    GtkWidget *box = panel_content_root(window);
     GList *children = gtk_container_get_children(GTK_CONTAINER(box));
     GList *iter = children;
     while (iter != NULL) {
@@ -2347,7 +2554,7 @@ gboolean recreate_original_buttons(gpointer user_data __attribute__((unused))) {
 void show_project_buttons(GtkWidget *parent_button __attribute__((unused)));
 void show_project_buttons(GtkWidget *parent_button __attribute__((unused))) {
     GtkWidget *window = anim_data->window;
-    GtkWidget *box = gtk_bin_get_child(GTK_BIN(window));
+    GtkWidget *box = panel_content_root(window);
     GList *children = gtk_container_get_children(GTK_CONTAINER(box));
     for (GList *iter = children; iter != NULL; iter = iter->next) {
         gtk_widget_destroy(GTK_WIDGET(iter->data));
@@ -2596,6 +2803,51 @@ static void on_button_clicked(GtkWidget *widget, gpointer user_data) {
             }
             return;
         }
+
+        /*
+         * 非预置 toggle（配置里自己写的 type=toggle 按钮）。
+         *
+         * 原版代码走到这里会直接 return，点了完全没反应。
+         * 现在改为：执行 cmd，然后用 initstate_cmd（若有）读回真实状态
+         * 刷新高亮；没有 initstate_cmd 就简单取反。
+         */
+        if (config->cmd[0] != '\0') {
+            if (config->confirm_cmd) {
+                GtkWidget *toplevel = gtk_widget_get_toplevel(widget);
+                if (toplevel && gtk_widget_is_toplevel(toplevel)) {
+                    show_confirmation_dialog(config, toplevel);
+                    return;
+                }
+            }
+            execute_command(config->cmd);
+        }
+
+        if (config->initstate_cmd[0] != '\0') {
+            /* 命令可能需要一点时间落地，延迟 200ms 再读状态 */
+            g_usleep(200 * 1000);
+            config->is_active = execute_command_get_result(config->initstate_cmd) != 0;
+        } else {
+            config->is_active = !config->is_active;
+        }
+
+        {
+            GtkStyleContext *context = gtk_widget_get_style_context(widget);
+            if (context) {
+                if (config->is_active) {
+                    gtk_style_context_add_class(context, "active-toggle");
+                } else {
+                    gtk_style_context_remove_class(context, "active-toggle");
+                }
+                update_button_icon(widget, config->is_active);
+                gtk_widget_queue_draw(widget);
+            }
+        }
+
+        /*
+         * 自定义 toggle 不收起面板：用户可能连续点几次。
+         * 需要在配置里写 option_close_on_toggle=1 才收起。
+         */
+        return;
     }
     if (config->is_preprogrammed) {
         if (strcmp(config->name, "Project") == 0) {
@@ -2783,6 +3035,7 @@ static GtkWidget* create_button_with_icon_and_label(ButtonConfig *config, int bu
     } else {
         box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     }
+    gtk_widget_set_halign(box, GTK_ALIGN_FILL);
     gtk_container_add(GTK_CONTAINER(button), box);
 
     if (config->is_preprogrammed && (strcmp(config->name, "PC screen only") == 0 ||
@@ -2802,7 +3055,7 @@ static GtkWidget* create_button_with_icon_and_label(ButtonConfig *config, int bu
         if (icon_path) {
             GdkPixbuf *original_pixbuf = gdk_pixbuf_new_from_file(icon_path, NULL);
             if (original_pixbuf) {
-                int icon_width = button_width / 4;
+                int icon_width = (int)(button_width * ICON_RATIO + 0.5f);
                 int original_width = gdk_pixbuf_get_width(original_pixbuf);
                 int original_height = gdk_pixbuf_get_height(original_pixbuf);
                 int icon_height = (icon_width * original_height) / original_width;
@@ -2820,8 +3073,11 @@ static GtkWidget* create_button_with_icon_and_label(ButtonConfig *config, int bu
                 }
                 GtkWidget *image = gtk_image_new_from_pixbuf(display_pixbuf);
                 gtk_widget_set_halign(image, GTK_ALIGN_START);
-                gtk_widget_set_margin_end(image, 15);
-                gtk_widget_set_margin_start(image, 15);
+                {
+                    int im = (int)(button_width * ICON_MARGIN_RATIO + 0.5f);
+                    gtk_widget_set_margin_end(image, im);
+                    gtk_widget_set_margin_start(image, im);
+                }
                 gtk_box_pack_start(GTK_BOX(box), image, FALSE, FALSE, 0);
                 if (display_pixbuf != scaled_pixbuf && display_pixbuf != NULL)
                     g_object_unref(display_pixbuf);
@@ -2849,7 +3105,7 @@ static GtkWidget* create_button_with_icon_and_label(ButtonConfig *config, int bu
         if (config->icon_path[0] != '\0') {
             original_pixbuf = gdk_pixbuf_new_from_file(config->icon_path, NULL);
             if (original_pixbuf) {
-                int icon_width = button_width / 4;
+                int icon_width = (int)(button_width * ICON_RATIO + 0.5f);
                 if (config->icon_only) {
                     icon_width = button_width * 0.6;
                 }
@@ -2932,10 +3188,12 @@ static GtkWidget* create_button_with_icon_and_label(ButtonConfig *config, int bu
                         #pragma GCC diagnostic pop
                         gtk_widget_set_halign(second_label, GTK_ALIGN_START);
                         gtk_label_set_line_wrap(GTK_LABEL(second_label), TRUE);
-                        gtk_label_set_lines(GTK_LABEL(second_label), 2);
+                        gtk_label_set_max_width_chars(GTK_LABEL(second_label), LABEL_MAX_CHARS);
+                        gtk_label_set_lines(GTK_LABEL(second_label), LABEL_MAX_LINES);
+                        gtk_label_set_line_wrap_mode(GTK_LABEL(second_label), PANGO_WRAP_CHAR);
                         gtk_label_set_ellipsize(GTK_LABEL(second_label), PANGO_ELLIPSIZE_END);
-                        gtk_label_set_max_width_chars(GTK_LABEL(second_label), 11);
-                        gtk_label_set_line_wrap_mode(GTK_LABEL(second_label), PANGO_WRAP_WORD_CHAR);
+                        gtk_widget_set_hexpand(GTK_WIDGET(second_label), FALSE);
+                        gtk_widget_set_halign(GTK_WIDGET(second_label), GTK_ALIGN_FILL);
                         gtk_box_pack_start(GTK_BOX(label_box), second_label, FALSE, FALSE, 0);
                         config->label_widget = second_label;
                     } else {
@@ -2946,10 +3204,17 @@ static GtkWidget* create_button_with_icon_and_label(ButtonConfig *config, int bu
                         #pragma GCC diagnostic pop
                         gtk_widget_set_halign(label, GTK_ALIGN_START);
                         gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
-                        gtk_label_set_lines(GTK_LABEL(label), 2);
                         gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
-                        gtk_label_set_max_width_chars(GTK_LABEL(label), 11);
-                        gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
+                        /* 宽度上限用字符数表达（GTK 会按当前字体换算成像素），
+                           不写死像素值，换字体/换屏都自动适应。 */
+                        gtk_label_set_max_width_chars(GTK_LABEL(label), LABEL_MAX_CHARS);
+                        gtk_label_set_lines(GTK_LABEL(label), LABEL_MAX_LINES);
+                        gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_CHAR);
+                        gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
+                        /* halign=FILL 让 label 接受被压缩到按钮宽度，
+                           否则它的 minimum width（最长不可断片段）会把按钮顶宽。 */
+                        gtk_widget_set_hexpand(GTK_WIDGET(label), FALSE);
+                        gtk_widget_set_halign(GTK_WIDGET(label), GTK_ALIGN_FILL);
                         gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, 0);
                         config->label_widget = label;
                     }
@@ -2966,9 +3231,18 @@ static GtkWidget* create_button_with_icon_and_label(ButtonConfig *config, int bu
         }
         gtk_style_context_add_class(gtk_widget_get_style_context(button), "original-button");
     }
+    /*
+     * ── 第 2 层强制：格子尺寸 ──
+     *
+     * set_size_request 只是「最小」请求，子控件若申请更大仍会被采纳。
+     * 所以同时把 halign/valign 设成 FILL，禁止子控件撑大自己；
+     * 再用 CSS 的 min-width/min-height 兜底（CSS 优先级高于 natural size）。
+     */
     gtk_widget_set_size_request(button, button_width, button_height);
-    gtk_widget_set_hexpand(button, TRUE);
+    gtk_widget_set_hexpand(button, FALSE);
     gtk_widget_set_vexpand(button, FALSE);
+    gtk_widget_set_halign(button, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(button, GTK_ALIGN_FILL);
     if (config->label_cmd[0] != '\0' && config->label_widget != NULL)
         start_label_timer(config);
     return button;
@@ -3373,18 +3647,23 @@ void update_toggle_button_states() {
 
 
 static GtkWidget* create_quick_settings_panel(int width, int height __attribute__((unused))) {
-    GtkWidget *quick_settings = gtk_box_new(GTK_ORIENTATION_VERTICAL, QUICKSETTINGS_BUTTON_MARGIN);
-    int usable_width = width - 2 * QUICKSETTINGS_MARGIN;
-    int button_width = (usable_width - 3 * QUICKSETTINGS_BUTTON_MARGIN) / QUICKSETTINGS_BUTTONS_PER_ROW;
+    /* 布局尺寸全部由面板宽按比例推导 */
+    int qs_margin = panel_margin_for(width);
+    int qs_gap    = panel_gap_for(width);
+
+    GtkWidget *quick_settings = gtk_box_new(GTK_ORIENTATION_VERTICAL, qs_gap);
+    int usable_width = width - 2 * qs_margin;
+    int button_width = (usable_width - (QUICKSETTINGS_BUTTONS_PER_ROW - 1) * qs_gap)
+                       / QUICKSETTINGS_BUTTONS_PER_ROW;
     int button_height = button_width * 4 / 5;   /* 4/5 给两行文字留高度 */
     int num_rows = (num_buttons + QUICKSETTINGS_BUTTONS_PER_ROW - 1) / QUICKSETTINGS_BUTTONS_PER_ROW;
     /* ★ 控制中心不再有「Delete notifications」按钮（通知中心自己带清空按钮） */
     delete_notifications_button = NULL;
     for (int row = 0, btn_idx = 0; row < num_rows; row++) {
-        GtkWidget *button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, QUICKSETTINGS_BUTTON_MARGIN);
-        gtk_widget_set_margin_start(button_row, QUICKSETTINGS_MARGIN);
-        gtk_widget_set_margin_end(button_row, QUICKSETTINGS_MARGIN);
-        gtk_widget_set_margin_bottom(button_row, QUICKSETTINGS_BUTTON_MARGIN);
+        GtkWidget *button_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, qs_gap);
+        gtk_widget_set_margin_start(button_row, qs_margin);
+        gtk_widget_set_margin_end(button_row, qs_margin);
+        gtk_widget_set_margin_bottom(button_row, qs_gap);
         int buttons_in_row = (row == num_rows - 1 && num_buttons % QUICKSETTINGS_BUTTONS_PER_ROW != 0) ?
             (num_buttons % QUICKSETTINGS_BUTTONS_PER_ROW ? num_buttons % QUICKSETTINGS_BUTTONS_PER_ROW : QUICKSETTINGS_BUTTONS_PER_ROW)
             : QUICKSETTINGS_BUTTONS_PER_ROW;
@@ -3407,15 +3686,24 @@ static GtkWidget* create_quick_settings_panel(int width, int height __attribute_
                     }
                 }
                 g_signal_connect(button, "clicked", G_CALLBACK(on_button_clicked), config);
-                gtk_box_pack_start(GTK_BOX(button_row), button, TRUE, TRUE, 0);
+                /*
+                 * expand=FALSE + fill=TRUE：
+                 *   GtkBox 会按 size_request 给每列固定宽度，按钮填满该槽位。
+                 * 若 expand=TRUE，GtkBox 会按每个按钮的"自然宽度"按比例分配，
+                 * 含长文字的列会抢到更多宽度，整体就把面板顶宽。
+                 */
+                gtk_box_pack_start(GTK_BOX(button_row), button, FALSE, TRUE, 0);
             }
         }
         for (int i = buttons_in_row; i < QUICKSETTINGS_BUTTONS_PER_ROW; i++) {
             GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
             gtk_widget_set_size_request(spacer, button_width, button_height);
-            gtk_box_pack_start(GTK_BOX(button_row), spacer, TRUE, TRUE, 0);
+            gtk_box_pack_start(GTK_BOX(button_row), spacer, FALSE, TRUE, 0);
         }
         gtk_box_pack_start(GTK_BOX(quick_settings), button_row, FALSE, FALSE, 0);
+        /* 行宽锁定为 4 列按钮 + 间隙，不参与任何拉伸计算 */
+        gtk_widget_set_size_request(button_row,
+            4 * button_width + 3 * qs_gap, -1);
     }
     GtkWidget *bottom_spacer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_set_size_request(bottom_spacer, -1, 12);
@@ -3432,8 +3720,8 @@ static GtkWidget* create_quick_settings_panel(int width, int height __attribute_
             gtk_widget_set_name(qs_sliders_box, "qs-sliders");
         }
         GtkWidget *slider_container = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-        gtk_widget_set_margin_start(slider_container, QUICKSETTINGS_MARGIN);
-        gtk_widget_set_margin_end(slider_container, QUICKSETTINGS_MARGIN);
+        gtk_widget_set_margin_start(slider_container, qs_margin);
+        gtk_widget_set_margin_end(slider_container, qs_margin);
         gtk_widget_set_margin_top(slider_container, 10);
         gtk_widget_set_margin_bottom(slider_container, 10);
         int total_slider_width = usable_width * 8 / 10;
@@ -3462,8 +3750,8 @@ static GtkWidget* create_quick_settings_panel(int width, int height __attribute_
 
         /* ===== 音量滑动条（上限 MAX_VOLUME_PCT）===== */
         GtkWidget *vol_container = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-        gtk_widget_set_margin_start(vol_container, QUICKSETTINGS_MARGIN);
-        gtk_widget_set_margin_end(vol_container, QUICKSETTINGS_MARGIN);
+        gtk_widget_set_margin_start(vol_container, qs_margin);
+        gtk_widget_set_margin_end(vol_container, qs_margin);
         gtk_widget_set_margin_top(vol_container, 6);
         GdkPixbuf *vpix = gdk_pixbuf_new_from_file_at_size(VOLUME_ICON_PATH, icon_size, icon_size, NULL);
         if (vpix) {
@@ -4006,7 +4294,7 @@ static GtkWidget *find_widget_by_name(GtkWidget *root, const char *name) {
 }
 
 static void regenerate_notifications(GtkWidget *window) {
-    GtkWidget *box = gtk_bin_get_child(GTK_BIN(window));
+    GtkWidget *box = panel_content_root(window);
     GtkWidget *notif_box = find_widget_by_name(box, "notification-box");
     if (!notif_box) return;
     GList *notif_children = gtk_container_get_children(GTK_CONTAINER(notif_box));
@@ -4425,26 +4713,59 @@ static void main_sidebar(void) {
     GdkMonitor *monitor = gdk_display_get_monitor(gdk_display_get_default(), 0);
     gdk_monitor_get_workarea(monitor, &workarea);
 //
-    int width;
-    if (workarea.width >= 1920) {
-        width = (int)(workarea.width / 4.4);
-    } else if (workarea.width >= 1600 && workarea.width < 1920) {
-        width = (int)(workarea.width / 4.2);
-    } else if (workarea.width > 1280 && workarea.width < 1600) {
-        width = (int)(workarea.width / 3.8);
-    } else {
-        width = (int)(workarea.width / 3.6);
-    }
-//
+    /*
+     * 面板宽度。
+     *
+     * 注意坐标系：GDK 返回的 workarea 是「逻辑像素」，
+     * 而 get_windowgeometry 报的是「物理像素」。本机 scale=2，
+     * workarea.width=1280 对应物理 2560。
+     *
+     * 因此这里全程用逻辑像素计算，最终 GTK 会按 scale 放大。
+     * 比例取 1/4.5 ≈ 0.222，与视觉设计基准一致。
+     */
+    int scale = gdk_monitor_get_scale_factor(monitor);
+    if (scale < 1) scale = 1;
+
+    int width = (int)(workarea.width / PANEL_W_DIVISOR + 0.5f);
+
+    /*
+     * 下限按「4 列按钮 + 间隙 + 外边距」的实际需要反推，
+     * 保证面板不会被内容顶宽。
+     *
+     * 每个按钮至少要放得下：图标宽 + 8 个字符的标签。
+     * 用字体尺寸估算字符宽度，不写死像素。
+     */
+    int fh = pango_font_description_get_size(panel_font_desc) / PANGO_SCALE;
+    if (fh < 8) fh = 8;
+    /*
+     * 反推最小宽度：
+     *   按钮内 图标占 0.25bw + 左右边距 0.15bw = 0.40bw，
+     *   剩余 0.60bw 给标签。标签至少放 4 个中文字 = 4*fh。
+     *   => bw >= 6.7*fh
+     *   4 列总宽 = 4bw + 3gap + 2margin = W
+     *   gap = 0.008W, margin = 0.017W
+     *   => W - 0.058W >= 4 * 6.7fh  =>  W >= 28.4fh
+     */
+    int need = (int)(fh * 29.0f + 0.5f);
+    if (width < need) width = need;
+    if (width > workarea.width / 2.2f) width = (int)(workarea.width / 2.2f);
+    if (width < 200) width = 200;
+
+    g_print("[qsidebar] screen=%dx%d scale=%d panel_w=%d (phys %d)\n",
+            workarea.width, workarea.height, scale, width, width * scale);
     int font_size = pango_font_description_get_size(panel_font_desc) / PANGO_SCALE;
     int delete_button_height = 0;   /* ★ 控制中心已无删除按钮 */
     int slider_height = (sidebar_flags & FLAG_BACKLIGHT_CONTROL) ? 40 : 0;
     int header_height = 30;
     int num_rows = (num_buttons + QUICKSETTINGS_BUTTONS_PER_ROW - 1) / QUICKSETTINGS_BUTTONS_PER_ROW;
-    int usable_width = width - 2 * QUICKSETTINGS_MARGIN;
-    int button_width = (usable_width - 3 * QUICKSETTINGS_BUTTON_MARGIN) / QUICKSETTINGS_BUTTONS_PER_ROW;
-    int button_height = button_width * 4 / 5;   /* 4/5 给两行文字留高度 */
-    int button_rows_height = num_rows * button_height + (num_rows > 1 ? (num_rows - 1) * QUICKSETTINGS_BUTTON_MARGIN : 0);
+    int qs_margin_h = panel_margin_for(width);
+    int qs_gap_h    = panel_gap_for(width);
+    int usable_width = width - 2 * qs_margin_h;
+    int button_width = (usable_width - (QUICKSETTINGS_BUTTONS_PER_ROW - 1) * qs_gap_h)
+                       / QUICKSETTINGS_BUTTONS_PER_ROW;
+    int button_height = (int)(button_width * BUTTON_ASPECT + 0.5f);
+    int button_rows_height = num_rows * button_height
+                             + (num_rows > 1 ? (num_rows - 1) * qs_gap_h : 0);
     int main_box_spacing = 20;
     int slider_bottom_margin = (sidebar_flags & FLAG_BACKLIGHT_CONTROL) ? 20 : 0;
     bottom_margin = 0;
@@ -4457,7 +4778,21 @@ static void main_sidebar(void) {
     int pas_anim = custom_ceil(workarea.width * 0.013);
     int pas_hide = custom_ceil(workarea.width * 0.018);
     calculate_max_notification_buttons_once(notif_height, num_buttons);
+    /*
+     * set_default_size 只是建议值。真正锁死宽度的是下面包住内容的
+     * FixClip（见 create_quick_settings_panel 里的说明），
+     * geometry hints 在这里只是明确告诉 WM「这个窗口不可缩放」。
+     */
+    GdkGeometry geo = {0};
+    geo.min_width  = width;
+    geo.max_width  = width;
+    geo.min_height = 1;
+    geo.max_height = G_MAXINT;
+    gtk_window_set_geometry_hints(GTK_WINDOW(window), NULL, &geo,
+                                  GDK_HINT_MIN_SIZE | GDK_HINT_MAX_SIZE);
+    gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
     gtk_window_set_default_size(GTK_WINDOW(window), width, window_height);
+
     if (panel_background[0] != '\0') {
         background_source = cairo_image_surface_create_from_png(panel_background);
         if (cairo_surface_status(background_source) != CAIRO_STATUS_SUCCESS) {
@@ -4481,7 +4816,46 @@ static void main_sidebar(void) {
         gtk_widget_set_visual(window, visual);
     }
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    gtk_container_add(GTK_CONTAINER(window), box);
+
+    /*
+     * ═══════════════════════════════════════════════════════════════
+     *  宽度硬裁剪：三层强制
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 问题：GTK 会把子控件的 minimum size request 一路往上汇总，
+     * 最终变成窗口的 minimum，窗口管理器照此放大窗口。
+     * 中文 GtkLabel 的 minimum 是「最长不可断片段」的宽度，
+     * 四列叠加后把面板顶宽，第四列就被挤出屏幕右边缘。
+     *
+     * gtk_window_set_geometry_hints() 的 min_width 只是提示，
+     * 实测 base size=638 而 minimum=668，说明提示被忽略。
+     * GtkScrolledWindow 同样无效（其 minimum 取自子控件）。
+     *
+     * 只有 GtkFixed 完全不参与布局协商——它的 minimum 纯粹来自
+     * 自己的 size_request，与子控件尺寸无关。
+     *
+     * 因此采用三层强制：
+     *   第 1 层  GtkFixed 容器      → 锁死窗口可报告的最小宽度
+     *   第 2 层  每个按钮            → 锁死格子尺寸（见 create_button_*）
+     *   第 3 层  格子内部 box/label   → 不参与最小尺寸计算（见下）
+     */
+
+    /* ── 第 1 层：FixClip 锁死窗口宽度（对外只报固定尺寸） ── */
+    GtkWidget *clip = fixclip_new(width, window_height);
+    gtk_widget_set_hexpand(clip, FALSE);
+    gtk_widget_set_vexpand(clip, FALSE);
+    gtk_widget_set_halign(clip, GTK_ALIGN_START);
+    gtk_widget_set_valign(clip, GTK_ALIGN_START);
+    gtk_container_add(GTK_CONTAINER(clip), box);
+
+    /* ── 第 3 层：box 自身也不参与向上申请（双保险） ── */
+    gtk_widget_set_hexpand(box, FALSE);
+    gtk_widget_set_vexpand(box, FALSE);
+    gtk_widget_set_halign(box, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(box, GTK_ALIGN_FILL);
+
+    gtk_container_add(GTK_CONTAINER(window), clip);
+
     GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_box_pack_start(GTK_BOX(box), header_box, FALSE, FALSE, 10);
     GtkWidget *label = gtk_label_new(panel_title);
@@ -5121,13 +5495,16 @@ static void slider_changed(GtkRange *range, gpointer user_data) {
 static gboolean update_button_label(gpointer data) {
     ButtonConfig *cfg = (ButtonConfig *)data;
     if (!cfg || !cfg->label_cmd[0] || !cfg->label_widget) return G_SOURCE_REMOVE;
+
     char full_cmd[MAX_LINE_LENGTH * 2];
     if (cfg->label_cmd[0] == '/')
         snprintf(full_cmd, sizeof(full_cmd), "%s", cfg->label_cmd);
     else
         snprintf(full_cmd, sizeof(full_cmd), "%s%s", SCRIPT_PATH, cfg->label_cmd);
+
     FILE *fp = popen(full_cmd, "r");
     if (!fp) return G_SOURCE_CONTINUE;
+
     char out[MAX_LINE_LENGTH] = {0};
     if (fgets(out, sizeof(out) - 1, fp)) {
         size_t L = strlen(out);
@@ -5135,6 +5512,25 @@ static gboolean update_button_label(gpointer data) {
         if (out[0]) gtk_label_set_text(GTK_LABEL(cfg->label_widget), out);
     }
     pclose(fp);
+
+    /* toggle 按钮：每次刷新文字时顺便同步高亮状态。
+       注意必须在文字更新之后做，且不能提前 return。 */
+    if (cfg->initstate_cmd[0] != '\0' && cfg->type[0] != '\0' &&
+        strcmp(cfg->type, "toggle") == 0 && cfg->button != NULL) {
+        gboolean now_active = execute_command_get_result(cfg->initstate_cmd) != 0;
+        if (now_active != cfg->is_active) {
+            cfg->is_active = now_active;
+            GtkStyleContext *ctx = gtk_widget_get_style_context(cfg->button);
+            if (ctx) {
+                if (now_active)
+                    gtk_style_context_add_class(ctx, "active-toggle");
+                else
+                    gtk_style_context_remove_class(ctx, "active-toggle");
+            }
+            gtk_widget_queue_draw(cfg->button);
+        }
+    }
+
     return G_SOURCE_CONTINUE;
 }
 
@@ -5156,13 +5552,27 @@ typedef struct {
 
 
 
+static void reply_get_capabilities(DBusMessage *msg, DBusConnection *conn) {
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    DBusMessageIter args, arr;
+    dbus_message_iter_init_append(reply, &args);
+    dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "s", &arr);
+    const char *caps[] = { "body", "icon-static", "persistence", "body-markup" };
+    for (unsigned i = 0; i < sizeof(caps)/sizeof(caps[0]); i++) {
+        dbus_message_iter_append_basic(&arr, DBUS_TYPE_STRING, &caps[i]);
+    }
+    dbus_message_iter_close_container(&args, &arr);
+    dbus_connection_send(conn, reply, NULL);
+    dbus_message_unref(reply);
+}
+
 static void reply_get_server_info(DBusMessage *msg, DBusConnection *conn) {
     DBusMessage *reply = dbus_message_new_method_return(msg);
     DBusMessageIter args;
     dbus_message_iter_init_append(reply, &args);
     const char *vendor = "qsidebar";
-    const char *version = "0.9";
-    const char *spec_version = "0.9";
+    const char *version = "1.0";
+    const char *spec_version = "1.2";   /* 必须是 >=1.0，libnotify 断言 major>0 */
     dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &vendor);
     dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &vendor);
     dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &version);
@@ -5355,6 +5765,24 @@ static void *dbus_thread_func(void *user_data) {
 static DBusHandlerResult dbus_message_filter(DBusConnection *conn, DBusMessage *msg, void *user_data __attribute__((unused))) {
     if (dbus_message_is_method_call(msg, "org.freedesktop.Notifications", "GetServerInformation")) {
         reply_get_server_info(msg, conn);
+        return DBUS_HANDLER_RESULT_HANDLED;
+    } else if (dbus_message_is_method_call(msg, "org.freedesktop.Notifications", "GetCapabilities")) {
+        reply_get_capabilities(msg, conn);
+        return DBUS_HANDLER_RESULT_HANDLED;
+    } else if (dbus_message_is_method_call(msg, "org.freedesktop.Notifications", "CloseNotification")) {
+        DBusMessage *reply = dbus_message_new_method_return(msg);
+        dbus_connection_send(conn, reply, NULL);
+        dbus_message_unref(reply);
+        return DBUS_HANDLER_RESULT_HANDLED;
+    } else if (dbus_message_is_method_call(msg, "org.freedesktop.Notifications", "GetNotifications")) {
+        /* 非必需；回空数组避免某些客户端超时 */
+        DBusMessage *reply = dbus_message_new_method_return(msg);
+        DBusMessageIter args, arr;
+        dbus_message_iter_init_append(reply, &args);
+        dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "(susssasa{sv}i)", &arr);
+        dbus_message_iter_close_container(&args, &arr);
+        dbus_connection_send(conn, reply, NULL);
+        dbus_message_unref(reply);
         return DBUS_HANDLER_RESULT_HANDLED;
     } else if (dbus_message_is_method_call(msg, "org.freedesktop.Notifications", "Notify")) {
         reply_notify(msg, conn);
