@@ -1,98 +1,193 @@
 #!/bin/bash
-# chgtrip —— 充电电流自动保护（超过阈值关断，不自动恢复）
+# chgtrip —— 充电口过流 / 过热保护守护进程
+#
+# 设计目标：防止「插上 10A 之类的异常供电」把接口或电池烧了。
+# 判定策略是「秒级 + 宽判定」：
+#   - 采样 1 秒一次，连续 2 次命中即跳闸，最快约 1 秒动作
+#   - 不要求 status=Charging（充满 / 涓流 / 温度保护时照样判）
+#   - 三个独立条件，任一命中都跳闸
+#
+# 为什么不只看 bq27541 的净充电流：
+#   那是「流进电池」的电流，异常供电灌进来时，多出来的功率被
+#   充电 IC 吃掉（变成发热）而不是进电池，净充电流可能反而很低。
+#   所以必须同时看「充电口协商电流」和「芯片温度」。
+#
+# 本机实测节点（Linux 7.1.0-1-gd5f7815e9a86 / lenovo-q706f）：
+#   pm8150b-charger  有 charging_enabled / current_now / usb_type，但没有 temp
+#   bq27541-0        有 current_now（净充电流）/ temp（0.1°C 单位）/ status / capacity
+#   tcpm-source-psy  有 usb_type / current_max（协商电流）/ voltage_now（协商电压）
+#   thermal_zone27   是 pm8150b-thermal（充电 IC 所在 PMIC 的芯片温度）
+#
+# 跳闸后不会自动恢复，必须手动 `chg on`。
 #
 # 用法:
-#   chgtrip            前台运行
-#   chgtrip -d         后台运行
-#   chgtrip --install  装成 systemd 服务并启动
-#
-# 规则:
-#   监测电池电流（bq27541 current_now）。
-#   连续 N 次采样都 > LIMIT_MA  → 立即 charging_enabled=0，写跳闸标记
-#   跳闸后不自动恢复，必须 chg on 手动重置
-#
-# 阈值配置: /etc/chgtrip.conf
-#   LIMIT_MA=400      电流阈值（mA）
-#   SAMPLES=3         连续超限次数（防抖）
-#   INTERVAL=5        采样间隔（秒）
-#
-# 为什么不用 current_max / icl_limit:
-#   本机实测证明 smb5 的 AICL 硬件环路会绕过 USBIN_CURRENT_LIMIT_CFG，
-#   icl_limit 从 100mA 到 1500mA 净充恒定 660mA，完全无效。
-#   charging_enabled 是唯一真正能断电的开关。
+#   chgtrip            前台运行（一般交给 systemd）
+#   chgtrip -t         只打印一次采样结果，不动作（调试用）
+
+set -u
 
 P=/sys/class/power_supply/pm8150b-charger
 B=/sys/class/power_supply/bq27541-0
-FLAG=/run/chg.tripped
+T=/sys/class/power_supply/tcpm-source-psy-c440000.spmi:pmic@2:typec@1500
 CONF=/etc/chgtrip.conf
+FLAG=/run/chg.tripped
 LOG=/var/log/chgtrip.log
+
+# ── 默认阈值（可被 /etc/chgtrip.conf 覆盖）────────────────────────────
+LIMIT_MA=800          # 净充电流上限（防电池被灌爆）
+LIMIT_PORT_MA=2000    # 充电口协商电流上限（防接口过流）
+LIMIT_TEMP=45         # 电池温度上限 °C
+LIMIT_PMIC_TEMP=60    # 充电 IC 所在 PMIC 温度上限 °C
+SAMPLES=2             # 连续命中次数
+INTERVAL=1            # 采样间隔（秒）
+GRACE=8               # 每次开启充电后的宽限期（秒），避开接通瞬间冲高
+
+[ -f "$CONF" ] && . "$CONF"
 
 rd() { cat "$1" 2>/dev/null || echo 0; }
 
-# ---------- 读配置 ----------
-LIMIT_MA=400
-SAMPLES=3
-INTERVAL=5
-if [ -f "$CONF" ]; then
-    v=$(grep -E '^LIMIT_MA=' "$CONF" 2>/dev/null | cut -d= -f2); [ -n "$v" ] && LIMIT_MA=$v
-    v=$(grep -E '^SAMPLES='  "$CONF" 2>/dev/null | cut -d= -f2); [ -n "$v" ] && SAMPLES=$v
-    v=$(grep -E '^INTERVAL=' "$CONF" 2>/dev/null | cut -d= -f2); [ -n "$v" ] && INTERVAL=$v
-fi
-case "$LIMIT_MA" in ''|*[!0-9]*) LIMIT_MA=400 ;; esac
-case "$SAMPLES"  in ''|*[!0-9]*) SAMPLES=3   ;; esac
-case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=5  ;; esac
-LIMIT_UA=$(( LIMIT_MA * 1000 ))
-
 log() {
-    local m="$(date '+%F %T') $*"
-    echo "$m" >> "$LOG" 2>/dev/null
-    logger -t chgtrip "$*" 2>/dev/null
-    [ "$QUIET" != "1" ] && echo "$m"
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
 }
 
-log "启动: 阈值 ${LIMIT_MA}mA, 连续 ${SAMPLES} 次, 采样 ${INTERVAL}s"
+# 从 thermal_zone 找 pm8150b-thermal（编号可能随内核变，不能写死 27）
+find_pmic_zone() {
+    local z t
+    for z in /sys/class/thermal/thermal_zone*/type; do
+        t=$(cat "$z" 2>/dev/null)
+        if [ "$t" = "pm8150b-thermal" ]; then
+            dirname "$z"
+            return 0
+        fi
+    done
+    return 1
+}
 
+PMIC_ZONE=$(find_pmic_zone)
+
+# 检查所有条件，把「超限原因」用 stdout 输出（空 = 一切正常）。
+#
+# ★ 为什么用 echo 而不是 return code 表示结果
+#
+#   bash 里 return 0 = 真、return 1 = 假，而「超限」直觉上像 0
+#   （"非空" / "命中"），这个语义在本脚本里被写反过两次——一次导致
+#   正常充电乱跳闸，一次导致真过流反而不跳。安全关键的代码不该
+#   依赖这种容易记反的约定。
+#
+#   改成：输出字符串 = 有超限（原因），输出空 = 正常。
+#   调用处 `reasons=$(check_over)` 一看就懂，没有真假颠倒的空间。
+check_over() {
+    local reasons=""
+
+    # ① 净充电流（bq27541，单位 µA）
+    local bq_ma
+    bq_ma=$(( $(rd "$B/current_now") / 1000 ))
+    if [ "$bq_ma" -gt "$LIMIT_MA" ]; then
+        reasons="${reasons}净充${bq_ma}mA>${LIMIT_MA} "
+    fi
+
+    # ② 充电口协商电流（TCPM，单位 µA）—— 这条才是防接口过流的关键
+    local port_ma
+    port_ma=$(( $(rd "$T/current_max") / 1000 ))
+    if [ "$port_ma" -gt "$LIMIT_PORT_MA" ]; then
+        reasons="${reasons}协商${port_ma}mA>${LIMIT_PORT_MA} "
+    fi
+
+    # ③ 电池温度（bq27541，单位 0.1°C）
+    local bt_c
+    bt_c=$(( $(rd "$B/temp") / 10 ))
+    if [ "$bt_c" -gt "$LIMIT_TEMP" ]; then
+        reasons="${reasons}电池${bt_c}°C>${LIMIT_TEMP} "
+    fi
+
+    # ④ 充电 IC 所在 PMIC 温度（thermal_zone，单位 0.001°C）
+    if [ -n "$PMIC_ZONE" ]; then
+        local pt_c
+        pt_c=$(( $(rd "$PMIC_ZONE/temp") / 1000 ))
+        if [ "$pt_c" -gt "$LIMIT_PMIC_TEMP" ]; then
+            reasons="${reasons}IC${pt_c}°C>${LIMIT_PMIC_TEMP} "
+        fi
+    fi
+
+    printf '%s' "${reasons% }"
+}
+
+# ── 调试模式：采样一次就退出 ─────────────────────────────────────────
+if [ "${1:-}" = "-t" ]; then
+    printf '净充电流   : %s mA  (上限 %s)\n' "$(( $(rd $B/current_now) / 1000 ))" "$LIMIT_MA"
+    printf '协商电流   : %s mA  (上限 %s)\n' "$(( $(rd $T/current_max) / 1000 ))" "$LIMIT_PORT_MA"
+    printf '协商电压   : %s mV\n' "$(( $(rd $T/voltage_now) / 1000 ))"
+    printf '电池温度   : %s °C  (上限 %s)\n' "$(( $(rd $B/temp) / 10 ))" "$LIMIT_TEMP"
+    printf 'PMIC 温度  : %s °C  (上限 %s)  [%s]\n' \
+        "$(( $(rd "$PMIC_ZONE/temp") / 1000 ))" "$LIMIT_PMIC_TEMP" "${PMIC_ZONE:-未找到}"
+    printf '电池状态   : %s  电量 %s%%\n' "$(rd $B/status)" "$(rd $B/capacity)"
+    printf '充电开关   : %s\n' "$(rd $P/charging_enabled)"
+    r=$(check_over)
+    if [ -n "$r" ]; then
+        printf '判定       : ★ 超限 —— %s\n' "$r"
+    else
+        printf '判定       : 正常\n'
+    fi
+    exit 0
+fi
+
+# ── 守护循环 ─────────────────────────────────────────────────────────
+log "启动: 净充<${LIMIT_MA}mA 协商<${LIMIT_PORT_MA}mA 电池<${LIMIT_TEMP}°C IC<${LIMIT_PMIC_TEMP}°C 连续${SAMPLES}次 采样${INTERVAL}s 宽限${GRACE}s"
+log "PMIC 温度节点: ${PMIC_ZONE:-未找到}"
+
+was_enabled=""
 over=0
-was_enabled=-1
+grace_until=0
 
 while :; do
-    en=$(rd $P/charging_enabled)
-    cur=$(rd $B/current_now)
-    st=$(cat "$B/status" 2>/dev/null)
-    cap=$(rd $B/capacity)
-    cur_ma=$(( cur / 1000 ))
+    en=$(rd "$P/charging_enabled")
+    cap=$(rd "$B/capacity")
+    st=$(rd "$B/status")
 
-    # 充电开关被手动改了，重置计数
+    # 开关状态变化时重置计数
     if [ "$en" != "$was_enabled" ]; then
-        case "$en" in
-          1) log "充电已开启 (状态 $st, ${cap}%)" ;;
-          0) log "充电已关闭" ;;
-        esac
+        if [ "$en" = "1" ]; then
+            grace_until=$(( $(date +%s) + GRACE ))
+            log "充电已开启 (状态 $st, ${cap}%)，${GRACE}s 宽限期内不判超限"
+        else
+            log "充电已关闭"
+        fi
         was_enabled=$en
         over=0
     fi
 
-    # 只在「开关开启 且 正在充电」时判超限
-    if [ "$en" = "1" ] && [ "$st" = "Charging" ]; then
-        if [ "$cur_ma" -gt "$LIMIT_MA" ]; then
-            over=$((over + 1))
-            [ "$over" -ge "$SAMPLES" ] && {
-                echo 0 > "$P/charging_enabled" 2>/dev/null
-                printf '%s 电流 %smA > %smA 连续%s次，已关断 (电量 %s%%)\n' \
-                    "$(date '+%F %T')" "$cur_ma" "$LIMIT_MA" "$SAMPLES" "$cap" > "$FLAG"
-                log "★ 跳闸: 电流 ${cur_ma}mA > ${LIMIT_MA}mA (连续${SAMPLES}次)，已关断充电"
-                log "  恢复方式: chg on  （不会自动恢复）"
-                over=0
-                was_enabled=0
-                sleep "$INTERVAL"
-                continue
-            }
-        else
-            [ "$over" -gt 0 ] && log "电流回落 ${cur_ma}mA ≤ ${LIMIT_MA}mA，计数清零"
-            over=0
-        fi
-    else
+    # 只有开关打开时才判超限（关了就没电流，不用管）
+    if [ "$en" != "1" ]; then
+        sleep "$INTERVAL"
+        continue
+    fi
+
+    # 宽限期
+    if [ "$(date +%s)" -lt "$grace_until" ]; then
         over=0
+        sleep "$INTERVAL"
+        continue
+    fi
+
+    # ★ 关键：不检查 status，只要开关开着就判
+    r=$(check_over)
+    if [ -z "$r" ]; then
+        over=0                    # 正常，计数清零
+    else
+        over=$(( over + 1 ))      # 有超限原因，累计
+        if [ "$over" -ge "$SAMPLES" ]; then
+            echo 0 > "$P/charging_enabled" 2>/dev/null
+            {
+                printf '%s ★ 跳闸: %s（连续%s次）\n' \
+                    "$(date '+%F %T')" "$r" "$SAMPLES"
+                printf '  电量 %s%%  状态 %s\n' "$cap" "$st"
+                printf '  恢复方式: chg on  （不会自动恢复）\n'
+            } > "$FLAG"
+            log "★ 跳闸: ${r}（连续${SAMPLES}次），已关断充电"
+            log "  电量 ${cap}%  恢复方式: chg on"
+            over=0
+            was_enabled=0
+        fi
     fi
 
     sleep "$INTERVAL"
