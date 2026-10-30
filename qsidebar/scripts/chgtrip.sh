@@ -31,18 +31,42 @@ B=/sys/class/power_supply/bq27541-0
 T=/sys/class/power_supply/tcpm-source-psy-c440000.spmi:pmic@2:typec@1500
 CONF=/etc/chgtrip.conf
 FLAG=/run/chg.tripped
+FULLFLAG=/run/chg.full
 LOG=/var/log/chgtrip.log
 
 # ── 默认阈值（可被 /etc/chgtrip.conf 覆盖）────────────────────────────
 LIMIT_MA=800          # 净充电流上限（防电池被灌爆）
-LIMIT_PORT_MA=2000    # 充电口协商电流上限（防接口过流）
+LIMIT_PORT_MA=3300    # 充电口协商电流上限（防接口过流）
 LIMIT_TEMP=45         # 电池温度上限 °C
 LIMIT_PMIC_TEMP=60    # 充电 IC 所在 PMIC 温度上限 °C
 SAMPLES=2             # 连续命中次数
 INTERVAL=1            # 采样间隔（秒）
 GRACE=8               # 每次开启充电后的宽限期（秒），避开接通瞬间冲高
 
+# ── 满电截止（滞回式，像笔记本一样）──────────────────────────────────
+# 电量 >= STOP_AT 时停止充电；掉到 <= RESUME_AT 时自动恢复充电。
+#
+# 为什么用滞回而不是单门限：如果只在 95% 单向关断，电量掉到 94%
+# 用户就会手动点开，充到 96% 又停，反复按压对电池更伤。
+# 留 5% 的间隔，充放都在一个周期内完成，不会来回抖动。
+#
+# 注意：满电截止和过流跳闸是两套独立机制
+#   满电截止  → 自动恢复（滞回）
+#   过流跳闸  → 不自动恢复，必须手动 chg on
+STOP_AT=95
+RESUME_AT=90
+
 [ -f "$CONF" ] && . "$CONF"
+
+# ── 参数自检：滞回必须 RESUME_AT < STOP_AT，否则会死循环 ──
+#
+# 实测过：如果 RESUME_AT >= STOP_AT，电量卡在两者之间时脚本会
+# 不停地在「满电截止」和「自动恢复」之间来回，每秒开关一次。
+# 这里强制拉开 1% 间隔，防止配置文件写错把充放电反复按压。
+if [ "$RESUME_AT" -ge "$STOP_AT" ]; then
+    RESUME_AT=$(( STOP_AT - 1 ))
+    [ "$RESUME_AT" -lt 1 ] && RESUME_AT=1
+fi
 
 rd() { cat "$1" 2>/dev/null || echo 0; }
 
@@ -122,6 +146,10 @@ if [ "${1:-}" = "-t" ]; then
         "$(( $(rd "$PMIC_ZONE/temp") / 1000 ))" "$LIMIT_PMIC_TEMP" "${PMIC_ZONE:-未找到}"
     printf '电池状态   : %s  电量 %s%%\n' "$(rd $B/status)" "$(rd $B/capacity)"
     printf '充电开关   : %s\n' "$(rd $P/charging_enabled)"
+    printf '满电截止   : >=%s%% 停止, <=%s%% 恢复\n' "$STOP_AT" "$RESUME_AT"
+    if [ -f "$FULLFLAG" ]; then
+        printf '满电状态   : 已因满电停止 (%s%%)\n' "$(rd $B/capacity)"
+    fi
     r=$(check_over)
     if [ -n "$r" ]; then
         printf '判定       : ★ 超限 —— %s\n' "$r"
@@ -133,6 +161,7 @@ fi
 
 # ── 守护循环 ─────────────────────────────────────────────────────────
 log "启动: 净充<${LIMIT_MA}mA 协商<${LIMIT_PORT_MA}mA 电池<${LIMIT_TEMP}°C IC<${LIMIT_PMIC_TEMP}°C 连续${SAMPLES}次 采样${INTERVAL}s 宽限${GRACE}s"
+log "满电截止: >=${STOP_AT}% 停止, <=${RESUME_AT}% 恢复"
 log "PMIC 温度节点: ${PMIC_ZONE:-未找到}"
 
 was_enabled=""
@@ -154,6 +183,36 @@ while :; do
         fi
         was_enabled=$en
         over=0
+    fi
+
+    # ── 满电截止（滞回）──────────────────────────────────────────
+    #
+    # >= STOP_AT  → 停止充电，写 FULLFLAG
+    # <= RESUME_AT → 自动恢复充电，清除 FULLFLAG
+    #
+    # 放在过流判定之前：已经满电就没必要再判电流了。
+    #
+    # 注意人工干预：如果用户手动 chg off 之后电量还高，这里不会
+    # 擅自把开关打开——只在「因满电截止」的情况下才自动恢复。
+    if [ -f "$FULLFLAG" ]; then
+        # 已处于满电截止态：只有掉到 RESUME_AT 以下才恢复
+        if [ "$cap" -le "$RESUME_AT" ] && [ "$en" != "1" ]; then
+            echo 1 > "$P/charging_enabled" 2>/dev/null
+            rm -f "$FULLFLAG"
+            log "电量 ${cap}% <= ${RESUME_AT}%，自动恢复充电"
+            grace_until=$(( $(date +%s) + GRACE ))
+            was_enabled=1
+            sleep "$INTERVAL"
+            continue
+        fi
+    elif [ "$en" = "1" ] && [ "$cap" -ge "$STOP_AT" ]; then
+        # 正在充电且到了截止电量：停止
+        echo 0 > "$P/charging_enabled" 2>/dev/null
+        printf '%s %s%%\n' "$(date '+%F %T')" "$cap" > "$FULLFLAG"
+        log "★ 满电截止: 电量 ${cap}% >= ${STOP_AT}%，已停止充电（掉到 ${RESUME_AT}% 自动恢复）"
+        was_enabled=0
+        sleep "$INTERVAL"
+        continue
     fi
 
     # 只有开关打开时才判超限（关了就没电流，不用管）

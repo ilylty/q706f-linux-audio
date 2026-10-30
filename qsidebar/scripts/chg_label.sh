@@ -12,6 +12,7 @@
 P=/sys/class/power_supply/pm8150b-charger
 B=/sys/class/power_supply/bq27541-0
 FLAG=/run/chg.tripped
+FULLFLAG=/run/chg.full
 CONF=/etc/chgtrip.conf
 
 rd() { cat "$1" 2>/dev/null || echo 0; }
@@ -25,12 +26,22 @@ cap=$(rd $B/capacity)
 cur=$(( $(rd $B/current_now) / 1000 ))
 st=$(rd $B/status)
 
+RESUME_AT=90
+[ -f "$CONF" ] && RESUME_AT=$(grep -E '^RESUME_AT=' "$CONF" 2>/dev/null | cut -d= -f2)
+case "$RESUME_AT" in ''|*[!0-9]*) RESUME_AT=90 ;; esac
+
 # 已跳闸：优先显示跳闸
 if [ -f "$FLAG" ]; then
     # /run/chg.tripped 第一行形如：
     #   2026-10-30 16:12:03 ★ 跳闸: 净充312mA>800 ...
     ma=$(grep -oE '[0-9]+mA' "$FLAG" 2>/dev/null | head -1)
     [ -n "$ma" ] && printf '跳闸 %s\n' "$ma" || printf '跳闸\n'
+    exit 0
+fi
+
+# 满电截止（滞回）：显示当前电量 + 恢复点，让主人知道何时会自动充
+if [ -f "$FULLFLAG" ]; then
+    printf '满电 %s%%\n' "$cap"
     exit 0
 fi
 
